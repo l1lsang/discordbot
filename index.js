@@ -40,15 +40,18 @@ function getLevel(count) {
 // =======================
 // 🚀 봇 준비 완료
 // =======================
-client.once("ready", () => {
-  console.log(`🤖 봇 로그인 완료: ${client.user.tag}`);
+client.on("ready", () => {
+  const activity = {
+    name: "서버 활동 랭킹 ▶ https://quokkabot.vercel.app",
+    type: 0 // PLAYING
+  };
 
-  // ⭐ 공개 랭킹 페이지 URL을 봇 상태에 표시
-  client.user.setActivity(
-    "서버 활동 랭킹 ▶ https://quokkabot.vercel.app/",
-    { type: "PLAYING" }
-  );
+  client.user.setPresence({
+    activities: [activity],
+    status: "online",
+  });
 });
+
 
 // =======================
 // 💬 메시지 감시 & 레벨링
@@ -115,4 +118,3 @@ client.login(process.env.DISCORD_TOKEN);
 app.listen(PORT, () => {
   console.log(`🌐 API 서버 실행중 → http://localhost:${PORT}`);
 });
-
