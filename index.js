@@ -46,7 +46,7 @@ client.once("ready", () => {
   // ⭐ 공개 랭킹 페이지 URL을 봇 상태에 표시
   client.user.setActivity(
     "서버 활동 랭킹 ▶ https://quokkabot.vercel.app/",
-    { type: "WATCHING" }
+    { type: "PLAYING" }
   );
 });
 
@@ -115,3 +115,4 @@ client.login(process.env.DISCORD_TOKEN);
 app.listen(PORT, () => {
   console.log(`🌐 API 서버 실행중 → http://localhost:${PORT}`);
 });
+
