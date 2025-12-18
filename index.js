@@ -1,4 +1,8 @@
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  PermissionsBitField,
+} from "discord.js";
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
@@ -10,7 +14,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 
 // =======================
 // 🤖 Discord Bot
@@ -41,9 +45,11 @@ function getLevel(count) {
 // 🚀 봇 준비 완료
 // =======================
 client.on("ready", () => {
+  console.log(`🤖 봇 로그인 완료: ${client.user.tag}`);
+
   const activity = {
     name: "서버 활동 랭킹 ▶ https://quokkabot.vercel.app",
-    type: 0 // PLAYING
+    type: 0, // PLAYING
   };
 
   client.user.setPresence({
@@ -51,7 +57,6 @@ client.on("ready", () => {
     status: "online",
   });
 });
-
 
 // =======================
 // 💬 메시지 감시 & 레벨링
@@ -83,10 +88,26 @@ client.on("messageCreate", (message) => {
 
   guildStats.set(userId, { count, level });
 
-  // 📊 개인 확인용 (선택)
+  // 📊 개인 레벨 확인
   if (message.content === "!내레벨") {
     message.reply(
       `📊 이 서버 기준 → Lv.${level} / 메시지 ${count}`
+    );
+  }
+
+  // 🧹 관리자 전용 활동 초기화
+  if (message.content === "!활동초기화") {
+    if (
+      !message.member.permissions.has(
+        PermissionsBitField.Flags.Administrator
+      )
+    ) {
+      return message.reply("⛔ 관리자만 사용할 수 있는 명령어입니다.");
+    }
+
+    userStats.set(guildId, new Map());
+    message.channel.send(
+      "🧹 이 서버의 활동 데이터가 관리자에 의해 초기화되었습니다."
     );
   }
 });
@@ -116,5 +137,5 @@ app.get("/api/stats/:guildId", (req, res) => {
 client.login(process.env.DISCORD_TOKEN);
 
 app.listen(PORT, () => {
-  console.log(`🌐 API 서버 실행중 → http://localhost:${PORT}`);
+  console.log(`🌐 API 서버 실행중 → ${PORT}`);
 });
