@@ -10,6 +10,22 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 
+import admin from "firebase-admin";
+import fs from "fs";
+
+// =======================
+// 🔥 Firebase 초기화
+// =======================
+const serviceAccount = JSON.parse(
+  fs.readFileSync("./firebase-key.json", "utf8")
+);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+
 // =======================
 // 🌐 Express API 서버
 // =======================
@@ -30,11 +46,8 @@ const client = new Client({
   ],
 });
 
-// Map<guildId, Map<userId, { count, level }>>
-const userStats = new Map();
-
 // =======================
-// 🔢 레벨 계산 함수
+// 🔢 레벨 계산 함수 (Lv.1 ~ Lv.20)
 // =======================
 function getLevel(count) {
   if (count >= 1000) return 20;
@@ -56,9 +69,8 @@ function getLevel(count) {
   if (count >= 150) return 4;
   if (count >= 70) return 3;
   if (count >= 30) return 2;
- if (count >= 5) return 1;
+  return 1;
 }
-
 
 // =======================
 // 📌 슬래시 커맨드 정의
@@ -83,7 +95,6 @@ const commands = [
 client.on("ready", async () => {
   console.log(`🤖 봇 로그인 완료: ${client.user.tag}`);
 
-  // 슬래시 커맨드 등록
   const rest = new REST({ version: "10" }).setToken(
     process.env.DISCORD_TOKEN
   );
@@ -99,7 +110,7 @@ client.on("ready", async () => {
     activities: [
       {
         name: "서버 활동 랭킹 ▶ https://quokkabot.vercel.app",
-        type: 0, // PLAYING
+        type: 0,
       },
     ],
     status: "online",
@@ -107,33 +118,41 @@ client.on("ready", async () => {
 });
 
 // =======================
-// 💬 메시지 감시 & 레벨링
+// 💬 메시지 감시 & 레벨링 (Firebase)
 // =======================
-client.on("messageCreate", (message) => {
+client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!message.guild) return;
 
   const guildId = message.guild.id;
   const userId = message.author.id;
 
-  if (!userStats.has(guildId)) {
-    userStats.set(guildId, new Map());
-  }
+  const userRef = db
+    .collection("guilds")
+    .doc(guildId)
+    .collection("users")
+    .doc(userId);
 
-  const guildStats = userStats.get(guildId);
-  const prev = guildStats.get(userId) || { count: 0, level: 1 };
+  const snap = await userRef.get();
+
+  const prev = snap.exists
+    ? snap.data()
+    : { count: 0, level: 1 };
 
   const count = prev.count + 1;
   const level = getLevel(count);
 
-  // 🎉 레벨업 알림
   if (level > prev.level) {
     message.channel.send(
       `🎉 ${message.member.displayName} 님이 **Lv.${level}** 달성!`
     );
   }
 
-  guildStats.set(userId, { count, level });
+  await userRef.set({
+    count,
+    level,
+    updatedAt: new Date(),
+  });
 });
 
 // =======================
@@ -143,22 +162,21 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, guild, member } = interaction;
-  const guildId = guild.id;
-
-  if (!userStats.has(guildId)) {
-    userStats.set(guildId, new Map());
-  }
-
-  const guildStats = userStats.get(guildId);
 
   // =======================
   // 📊 /내레벨
   // =======================
   if (commandName === "내레벨") {
-    const stat = guildStats.get(member.id) || {
-      count: 0,
-      level: 1,
-    };
+    const userRef = db
+      .collection("guilds")
+      .doc(guild.id)
+      .collection("users")
+      .doc(member.id);
+
+    const snap = await userRef.get();
+    const stat = snap.exists
+      ? snap.data()
+      : { count: 0, level: 1 };
 
     return interaction.reply({
       content: `📊 **${member.displayName}**\nLv.${stat.level} / 메시지 ${stat.count}`,
@@ -170,22 +188,28 @@ client.on("interactionCreate", async (interaction) => {
   // 🏆 /랭킹
   // =======================
   if (commandName === "랭킹") {
-    const sorted = [...guildStats.entries()]
-      .sort((a, b) => b[1].count - a[1].count)
-      .slice(0, 5);
+    const snap = await db
+      .collection("guilds")
+      .doc(guild.id)
+      .collection("users")
+      .orderBy("count", "desc")
+      .limit(5)
+      .get();
 
-    if (sorted.length === 0) {
+    if (snap.empty) {
       return interaction.reply("아직 활동 데이터가 없습니다 💤");
     }
 
     const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
     let text = "🏆 **서버 활동 랭킹 TOP 5**\n\n";
 
-    for (let i = 0; i < sorted.length; i++) {
-      const [userId, data] = sorted[i];
-      const m = await guild.members.fetch(userId);
+    let i = 0;
+    for (const doc of snap.docs) {
+      const m = await guild.members.fetch(doc.id);
+      const data = doc.data();
 
       text += `${medals[i]} ${m.displayName} (Lv.${data.level}) — ${data.count}회\n`;
+      i++;
     }
 
     return interaction.reply(text);
@@ -206,7 +230,17 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    userStats.set(guildId, new Map());
+    const usersRef = db
+      .collection("guilds")
+      .doc(guild.id)
+      .collection("users");
+
+    const snap = await usersRef.get();
+    const batch = db.batch();
+
+    snap.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+
     return interaction.reply(
       "🧹 서버 활동 데이터가 초기화되었습니다."
     );
@@ -216,18 +250,20 @@ client.on("interactionCreate", async (interaction) => {
 // =======================
 // 🌐 API (외부 랭킹 조회용)
 // =======================
-app.get("/api/stats/:guildId", (req, res) => {
+app.get("/api/stats/:guildId", async (req, res) => {
   const { guildId } = req.params;
-  const guildStats = userStats.get(guildId);
 
-  if (!guildStats) return res.json([]);
+  const snap = await db
+    .collection("guilds")
+    .doc(guildId)
+    .collection("users")
+    .orderBy("count", "desc")
+    .get();
 
-  const data = Array.from(guildStats.entries()).map(
-    ([userId, value]) => ({
-      userId,
-      ...value,
-    })
-  );
+  const data = snap.docs.map(doc => ({
+    userId: doc.id,
+    ...doc.data(),
+  }));
 
   res.json(data);
 });
