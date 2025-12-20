@@ -11,13 +11,12 @@ import cors from "cors";
 import "dotenv/config";
 
 import admin from "firebase-admin";
-import fs from "fs";
 
 // =======================
-// 🔥 Firebase 초기화
+// 🔥 Firebase 초기화 (Render 환경변수)
 // =======================
 const serviceAccount = JSON.parse(
-  fs.readFileSync("./firebase-key.json", "utf8")
+  process.env.FIREBASE_SERVICE_ACCOUNT
 );
 
 admin.initializeApp({
@@ -69,7 +68,7 @@ function getLevel(count) {
   if (count >= 150) return 4;
   if (count >= 70) return 3;
   if (count >= 30) return 2;
-  return 1;
+  if (count >= 5) return 1;
 }
 
 // =======================
@@ -151,7 +150,7 @@ client.on("messageCreate", async (message) => {
   await userRef.set({
     count,
     level,
-    updatedAt: new Date(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 });
 
