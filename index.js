@@ -2,6 +2,9 @@ import {
   Client,
   GatewayIntentBits,
   PermissionsBitField,
+  SlashCommandBuilder,
+  REST,
+  Routes,
 } from "discord.js";
 import express from "express";
 import cors from "cors";
@@ -42,18 +45,47 @@ function getLevel(count) {
 }
 
 // =======================
+// 📌 슬래시 커맨드 정의
+// =======================
+const commands = [
+  new SlashCommandBuilder()
+    .setName("내레벨")
+    .setDescription("이 서버에서 나의 활동 레벨을 확인합니다"),
+
+  new SlashCommandBuilder()
+    .setName("랭킹")
+    .setDescription("서버 활동 랭킹 TOP 5를 확인합니다"),
+
+  new SlashCommandBuilder()
+    .setName("활동초기화")
+    .setDescription("서버 활동 데이터를 초기화합니다 (관리자 전용)"),
+].map(cmd => cmd.toJSON());
+
+// =======================
 // 🚀 봇 준비 완료
 // =======================
-client.on("ready", () => {
+client.on("ready", async () => {
   console.log(`🤖 봇 로그인 완료: ${client.user.tag}`);
 
-  const activity = {
-    name: "서버 활동 랭킹 ▶ https://quokkabot.vercel.app",
-    type: 0, // PLAYING
-  };
+  // 슬래시 커맨드 등록
+  const rest = new REST({ version: "10" }).setToken(
+    process.env.DISCORD_TOKEN
+  );
+
+  await rest.put(
+    Routes.applicationCommands(client.user.id),
+    { body: commands }
+  );
+
+  console.log("✅ 슬래시 커맨드 등록 완료");
 
   client.user.setPresence({
-    activities: [activity],
+    activities: [
+      {
+        name: "서버 활동 랭킹 ▶ https://quokkabot.vercel.app",
+        type: 0, // PLAYING
+      },
+    ],
     status: "online",
   });
 });
@@ -63,12 +95,11 @@ client.on("ready", () => {
 // =======================
 client.on("messageCreate", (message) => {
   if (message.author.bot) return;
-  if (!message.guild) return; // DM 제외
+  if (!message.guild) return;
 
   const guildId = message.guild.id;
   const userId = message.author.id;
 
-  // 서버 데이터 없으면 생성
   if (!userStats.has(guildId)) {
     userStats.set(guildId, new Map());
   }
@@ -82,41 +113,93 @@ client.on("messageCreate", (message) => {
   // 🎉 레벨업 알림
   if (level > prev.level) {
     message.channel.send(
-      `🎉 ${message.author} 이 서버에서 **Lv.${level}** 달성!`
+      `🎉 ${message.member.displayName} 님이 **Lv.${level}** 달성!`
     );
   }
 
   guildStats.set(userId, { count, level });
+});
 
-  // 📊 개인 레벨 확인
-  if (message.content === "!내레벨") {
-    message.reply(
-      `📊 이 서버 기준 → Lv.${level} / 메시지 ${count}`
-    );
+// =======================
+// 🧠 슬래시 커맨드 처리
+// =======================
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName, guild, member } = interaction;
+  const guildId = guild.id;
+
+  if (!userStats.has(guildId)) {
+    userStats.set(guildId, new Map());
   }
 
-  // 🧹 관리자 전용 활동 초기화
-  if (message.content === "!활동초기화") {
+  const guildStats = userStats.get(guildId);
+
+  // =======================
+  // 📊 /내레벨
+  // =======================
+  if (commandName === "내레벨") {
+    const stat = guildStats.get(member.id) || {
+      count: 0,
+      level: 1,
+    };
+
+    return interaction.reply({
+      content: `📊 **${member.displayName}**\nLv.${stat.level} / 메시지 ${stat.count}`,
+      ephemeral: true,
+    });
+  }
+
+  // =======================
+  // 🏆 /랭킹
+  // =======================
+  if (commandName === "랭킹") {
+    const sorted = [...guildStats.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 5);
+
+    if (sorted.length === 0) {
+      return interaction.reply("아직 활동 데이터가 없습니다 💤");
+    }
+
+    const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
+    let text = "🏆 **서버 활동 랭킹 TOP 5**\n\n";
+
+    for (let i = 0; i < sorted.length; i++) {
+      const [userId, data] = sorted[i];
+      const m = await guild.members.fetch(userId);
+
+      text += `${medals[i]} ${m.displayName} (Lv.${data.level}) — ${data.count}회\n`;
+    }
+
+    return interaction.reply(text);
+  }
+
+  // =======================
+  // 🧹 /활동초기화
+  // =======================
+  if (commandName === "활동초기화") {
     if (
-      !message.member.permissions.has(
+      !member.permissions.has(
         PermissionsBitField.Flags.Administrator
       )
     ) {
-      return message.reply("⛔ 관리자만 사용할 수 있는 명령어입니다.");
+      return interaction.reply({
+        content: "⛔ 관리자만 사용할 수 있습니다.",
+        ephemeral: true,
+      });
     }
 
     userStats.set(guildId, new Map());
-    message.channel.send(
-      "🧹 이 서버의 활동 데이터가 관리자에 의해 초기화되었습니다."
+    return interaction.reply(
+      "🧹 서버 활동 데이터가 초기화되었습니다."
     );
   }
 });
 
 // =======================
-// 🌐 API (공개 랭킹 조회용)
+// 🌐 API (외부 랭킹 조회용)
 // =======================
-
-// 서버별 유저 활동 조회 (읽기 전용)
 app.get("/api/stats/:guildId", (req, res) => {
   const { guildId } = req.params;
   const guildStats = userStats.get(guildId);
