@@ -68,7 +68,7 @@ function getLevel(count) {
   if (count >= 150) return 4;
   if (count >= 70) return 3;
   if (count >= 30) return 2;
-  if (count >= 5) return 1;
+ return 1;
 }
 
 // =======================
