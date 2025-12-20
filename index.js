@@ -37,12 +37,28 @@ const userStats = new Map();
 // 🔢 레벨 계산 함수
 // =======================
 function getLevel(count) {
-  if (count >= 100) return 5;
-  if (count >= 60) return 4;
-  if (count >= 30) return 3;
-  if (count >= 10) return 2;
-  return 1;
+  if (count >= 1000) return 20;
+  if (count >= 900) return 19;
+  if (count >= 820) return 18;
+  if (count >= 750) return 17;
+  if (count >= 690) return 16;
+  if (count >= 630) return 15;
+  if (count >= 580) return 14;
+  if (count >= 530) return 13;
+  if (count >= 490) return 12;
+  if (count >= 450) return 11;
+  if (count >= 410) return 10;
+  if (count >= 370) return 9;
+  if (count >= 330) return 8;
+  if (count >= 290) return 7;
+  if (count >= 250) return 6;
+  if (count >= 210) return 5;
+  if (count >= 150) return 4;
+  if (count >= 70) return 3;
+  if (count >= 30) return 2;
+ if (count >= 5) return 1;
 }
+
 
 // =======================
 // 📌 슬래시 커맨드 정의
