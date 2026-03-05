@@ -320,7 +320,7 @@ if (commandName === "상담종료") {
     if (
       !member.permissions.has(
         PermissionsBitField.Flags.Administrator
-      )
+      ) 
     ) {
       return interaction.reply({
         content: "⛔ 관리자만 사용할 수 있습니다.",
