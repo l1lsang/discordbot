@@ -172,10 +172,14 @@ if (commandName === "상담신청") {
   const member = interaction.member;
 
   const CONSULT_CATEGORY_IDS =
-    process.env.CONSULT_CATEGORY_IDS.split(",");
+  process.env.CONSULT_CATEGORY_IDS
+    ?.split(",")
+    .map(id => id.trim()) || [];
 
-  const ADMIN_ROLE_IDS =
-    process.env.ADMIN_ROLE_IDS.split(",");
+const ADMIN_ROLE_IDS =
+  process.env.ADMIN_ROLE_IDS
+    ?.split(",")
+    .map(id => id.trim()) || [];
 
   // 카테고리 랜덤 선택
   const categoryId =
