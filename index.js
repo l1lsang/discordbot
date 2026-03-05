@@ -78,7 +78,13 @@ const commands = [
   new SlashCommandBuilder()
     .setName("랭킹")
     .setDescription("서버 활동 랭킹 TOP 5를 확인합니다"),
+new SlashCommandBuilder()
+  .setName("상담신청")
+  .setDescription("관리자에게 상담을 요청합니다"),
 
+new SlashCommandBuilder()
+  .setName("상담종료")
+  .setDescription("현재 상담을 종료합니다 (관리자)"),
   new SlashCommandBuilder()
     .setName("활동초기화")
     .setDescription("서버 활동 데이터를 초기화합니다 (관리자 전용)"),
@@ -157,7 +163,104 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, guild, member } = interaction;
+// =======================
+// 🎫 /상담신청
+// =======================
+if (commandName === "상담신청") {
 
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  const CONSULT_CATEGORY_IDS =
+    process.env.CONSULT_CATEGORY_IDS.split(",");
+
+  const ADMIN_ROLE_IDS =
+    process.env.ADMIN_ROLE_IDS.split(",");
+
+  // 카테고리 랜덤 선택
+  const categoryId =
+    CONSULT_CATEGORY_IDS[
+      Math.floor(Math.random() * CONSULT_CATEGORY_IDS.length)
+    ];
+
+  // 관리자 권한 배열 생성
+  const adminPermissions = ADMIN_ROLE_IDS.map(roleId => ({
+    id: roleId,
+    allow: [
+      PermissionsBitField.Flags.ViewChannel,
+      PermissionsBitField.Flags.SendMessages,
+    ],
+  }));
+
+  const channel = await guild.channels.create({
+    name: `상담-${member.user.username}`,
+    type: 0,
+    parent: categoryId,
+
+    permissionOverwrites: [
+      {
+        id: guild.id,
+        deny: [PermissionsBitField.Flags.ViewChannel],
+      },
+      {
+        id: member.id,
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.SendMessages,
+        ],
+      },
+      ...adminPermissions,
+    ],
+  });
+
+  await channel.send(
+`📩 **새 상담이 시작되었습니다**
+
+👤 신청자: <@${member.id}>
+
+관리자가 곧 도와드립니다 🙏`
+  );
+
+  return interaction.reply({
+    content: `✅ 상담 채널이 생성되었습니다 → ${channel}`,
+    ephemeral: true,
+  });
+}// =======================
+// 🧹 /상담종료
+// =======================
+if (commandName === "상담종료") {
+
+  const ADMIN_ROLE_IDS =
+    process.env.ADMIN_ROLE_IDS.split(",");
+
+  const memberRoles = interaction.member.roles.cache;
+
+  const isAdmin = ADMIN_ROLE_IDS.some(roleId =>
+    memberRoles.has(roleId)
+  );
+
+  if (!isAdmin) {
+    return interaction.reply({
+      content: "⛔ 관리자만 상담을 종료할 수 있습니다.",
+      ephemeral: true,
+    });
+  }
+
+  const channel = interaction.channel;
+
+  if (!channel.name.startsWith("상담-")) {
+    return interaction.reply({
+      content: "❌ 상담 채널에서만 사용할 수 있습니다.",
+      ephemeral: true,
+    });
+  }
+
+  await interaction.reply("🧹 상담을 종료합니다. 채널을 삭제합니다.");
+
+  setTimeout(() => {
+    channel.delete();
+  }, 3000);
+}
   // =======================
   // 📊 /내레벨
   // =======================
