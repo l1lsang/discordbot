@@ -188,8 +188,11 @@ const ADMIN_ROLE_IDS =
     ];
 
   // 관리자 권한 배열 생성
-  const adminPermissions = ADMIN_ROLE_IDS.map(roleId => ({
-    id: roleId,
+  const adminPermissions = ADMIN_ROLE_IDS
+  .map(id => guild.roles.cache.get(id))
+  .filter(role => role)
+  .map(role => ({
+    id: role.id,
     allow: [
       PermissionsBitField.Flags.ViewChannel,
       PermissionsBitField.Flags.SendMessages,
