@@ -168,75 +168,134 @@ client.on("interactionCreate", async (interaction) => {
 // =======================
 if (commandName === "상담신청") {
 
-  const guild = interaction.guild;
-  const member = interaction.member;
+  try {
 
-  const CONSULT_CATEGORY_IDS =
-  process.env.CONSULT_CATEGORY_IDS
-    ?.split(",")
-    .map(id => id.trim()) || [];
+    const guild = interaction.guild;
+    const member = interaction.member;
 
-const ADMIN_ROLE_IDS =
-  process.env.ADMIN_ROLE_IDS
-    ?.split(",")
-    .map(id => id.trim()) || [];
+    if (!guild || !member) {
+      console.log("❌ guild 또는 member 없음");
+      return;
+    }
 
-  // 카테고리 랜덤 선택
-  const categoryId =
-    CONSULT_CATEGORY_IDS[
-      Math.floor(Math.random() * CONSULT_CATEGORY_IDS.length)
-    ];
+    const CONSULT_CATEGORY_IDS =
+      process.env.CONSULT_CATEGORY_IDS
+        ?.split(",")
+        .map(id => id.trim()) || [];
 
-  // 관리자 권한 배열 생성
-  const adminPermissions = ADMIN_ROLE_IDS
-  .map(id => guild.roles.cache.get(id))
-  .filter(role => role)
-  .map(role => ({
-    id: role.id,
-    allow: [
-      PermissionsBitField.Flags.ViewChannel,
-      PermissionsBitField.Flags.SendMessages,
-    ],
-  }));
+    const ADMIN_ROLE_IDS =
+      process.env.ADMIN_ROLE_IDS
+        ?.split(",")
+        .map(id => id.trim()) || [];
 
-  const channel = await guild.channels.create({
-    name: `상담-${member.user.username}`,
-    type: 0,
-    parent: categoryId,
+    console.log("📂 카테고리 목록:", CONSULT_CATEGORY_IDS);
+    console.log("🛠 관리자 역할:", ADMIN_ROLE_IDS);
 
-    permissionOverwrites: [
-      {
-        id: guild.id,
-        deny: [PermissionsBitField.Flags.ViewChannel],
-      },
-      {
-        id: member.id,
+    if (CONSULT_CATEGORY_IDS.length === 0) {
+      console.log("❌ 카테고리 환경변수 없음");
+      return interaction.reply({
+        content: "❌ 상담 카테고리가 설정되지 않았습니다.",
+        ephemeral: true,
+      });
+    }
+
+    // 카테고리 랜덤 선택
+    const categoryId =
+      CONSULT_CATEGORY_IDS[
+        Math.floor(Math.random() * CONSULT_CATEGORY_IDS.length)
+      ];
+
+    console.log("🎯 선택된 카테고리:", categoryId);
+
+    const category = guild.channels.cache.get(categoryId);
+
+    if (!category) {
+      console.log("❌ 카테고리를 찾을 수 없음:", categoryId);
+
+      console.log(
+        "📋 서버 채널 목록:",
+        guild.channels.cache.map(c => ({
+          id: c.id,
+          name: c.name,
+          type: c.type
+        }))
+      );
+
+      return interaction.reply({
+        content: "❌ 상담 카테고리를 찾을 수 없습니다.",
+        ephemeral: true,
+      });
+    }
+
+    console.log("✅ 카테고리 확인:", category.name);
+
+    // 관리자 권한 배열 생성
+    const adminPermissions = ADMIN_ROLE_IDS
+      .map(id => guild.roles.cache.get(id))
+      .filter(role => role)
+      .map(role => ({
+        id: role.id,
         allow: [
           PermissionsBitField.Flags.ViewChannel,
           PermissionsBitField.Flags.SendMessages,
         ],
-      },
-      ...adminPermissions,
-    ],
-  });
+      }));
 
- // 관리자 멘션 문자열
-const adminMentions = ADMIN_ROLE_IDS
-  .map(id => `<@&${id}>`)
-  .join(" ");
+    console.log("🔐 관리자 권한 설정:", adminPermissions);
 
-await channel.send(
+    const channel = await guild.channels.create({
+      name: `상담-${member.user.username}`,
+      type: 0,
+      parent: category.id,
+
+      permissionOverwrites: [
+        {
+          id: guild.id,
+          deny: [PermissionsBitField.Flags.ViewChannel],
+        },
+        {
+          id: member.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+          ],
+        },
+        ...adminPermissions,
+      ],
+    });
+
+    console.log("✅ 상담 채널 생성:", channel.id);
+
+    // 관리자 멘션 문자열
+    const adminMentions = ADMIN_ROLE_IDS
+      .map(id => `<@&${id}>`)
+      .join(" ");
+
+    await channel.send(
 `📩 **새 상담이 시작되었습니다**
 
 👤 신청자: <@${member.id}>
 
 ${adminMentions} 상담 요청이 들어왔습니다 🙏`
-);
+    );
 
-  return interaction.reply({
-    content: `✅ 상담 채널이 생성되었습니다 → ${channel}`,
-    ephemeral: true,
-  });
+    console.log("📨 상담 시작 메시지 전송");
+
+    return interaction.reply({
+      content: `✅ 상담 채널이 생성되었습니다 → ${channel}`,
+      ephemeral: true,
+    });
+
+  } catch (error) {
+
+    console.error("🚨 상담 채널 생성 오류:", error);
+
+    return interaction.reply({
+      content: "❌ 상담 채널 생성 중 오류가 발생했습니다.",
+      ephemeral: true,
+    });
+  }
+}
 }// =======================
 // 🧹 /상담종료
 // =======================
