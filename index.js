@@ -220,13 +220,18 @@ const ADMIN_ROLE_IDS =
     ],
   });
 
-  await channel.send(
+ // 관리자 멘션 문자열
+const adminMentions = ADMIN_ROLE_IDS
+  .map(id => `<@&${id}>`)
+  .join(" ");
+
+await channel.send(
 `📩 **새 상담이 시작되었습니다**
 
 👤 신청자: <@${member.id}>
 
-관리자가 곧 도와드립니다 🙏`
-  );
+${adminMentions} 상담 요청이 들어왔습니다 🙏`
+);
 
   return interaction.reply({
     content: `✅ 상담 채널이 생성되었습니다 → ${channel}`,
