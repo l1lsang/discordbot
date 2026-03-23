@@ -1,10 +1,12 @@
 import {
+  ActionRowBuilder,
   Client,
   GatewayIntentBits,
   PermissionsBitField,
   SlashCommandBuilder,
   REST,
   Routes,
+  StringSelectMenuBuilder,
 } from "discord.js";
 import express from "express";
 import cors from "cors";
@@ -44,6 +46,14 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
 });
+
+const CONSULT_TYPE_OPTIONS = [
+  "학업 · 진로",
+  "인간관계",
+  "연애 · 가족",
+  "감정 기복 · 번아웃",
+  "기타",
+];
 
 // =======================
 // 🔢 레벨 계산 함수 (Lv.1 ~ Lv.20)
@@ -160,6 +170,45 @@ client.on("messageCreate", async (message) => {
 // 🧠 슬래시 커맨드 처리
 // =======================
 client.on("interactionCreate", async (interaction) => {
+  if (
+    interaction.isStringSelectMenu() &&
+    interaction.customId.startsWith("consult-type:")
+  ) {
+    const [, requesterId] = interaction.customId.split(":");
+
+    if (interaction.user.id !== requesterId) {
+      return interaction.reply({
+        content: "❌ 상담을 신청한 사용자만 상담 유형을 선택할 수 있습니다.",
+        ephemeral: true,
+      });
+    }
+
+    const selectedType = interaction.values[0];
+
+    const disabledMenu = new StringSelectMenuBuilder()
+      .setCustomId(interaction.customId)
+      .setPlaceholder("상담 유형이 선택되었습니다")
+      .setDisabled(true)
+      .addOptions(
+        CONSULT_TYPE_OPTIONS.map((label) => ({
+          label,
+          value: label,
+          default: label === selectedType,
+        }))
+      );
+
+    const row = new ActionRowBuilder().addComponents(disabledMenu);
+
+    await interaction.update({
+      content: `어떤 유형의 상담을 받고 싶은가요??\n선택된 상담 유형: **${selectedType}**`,
+      components: [row],
+    });
+
+    return interaction.followUp({
+      content: `# ${selectedType} 형식의 상담입니다`,
+    });
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, guild, member } = interaction;
@@ -278,6 +327,25 @@ if (commandName === "상담신청") {
 
 ${adminMentions} 상담 요청이 들어왔습니다 🙏`
     );
+
+    const consultTypeMenu = new StringSelectMenuBuilder()
+      .setCustomId(`consult-type:${member.id}`)
+      .setPlaceholder("상담 유형을 선택해주세요")
+      .addOptions(
+        CONSULT_TYPE_OPTIONS.map((label) => ({
+          label,
+          value: label,
+        }))
+      );
+
+    const consultTypeRow = new ActionRowBuilder().addComponents(
+      consultTypeMenu
+    );
+
+    await channel.send({
+      content: "어떤 유형의 상담을 받고 싶은가요??",
+      components: [consultTypeRow],
+    });
 
     console.log("📨 상담 시작 메시지 전송");
 
