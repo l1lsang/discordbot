@@ -13,6 +13,11 @@ import cors from "cors";
 import "dotenv/config";
 
 import admin from "firebase-admin";
+import {
+  handleSecurityCommand,
+  registerSecurityHandlers,
+  securityCommandBuilders,
+} from "./securitySuite.js";
 
 // =======================
 // 🔥 Firebase 초기화 (Render 환경변수)
@@ -42,7 +47,9 @@ const PORT = process.env.PORT || 4000;
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildModeration,
     GatewayIntentBits.MessageContent,
   ],
 });
@@ -54,6 +61,8 @@ const CONSULT_TYPE_OPTIONS = [
   "감정 기복 · 번아웃",
   "기타",
 ];
+
+registerSecurityHandlers(client, db);
 
 // =======================
 // 🔢 레벨 계산 함수 (Lv.1 ~ Lv.20)
@@ -113,6 +122,7 @@ new SlashCommandBuilder()
   .setDefaultMemberPermissions(
     PermissionsBitField.Flags.BanMembers
   ),
+  ...securityCommandBuilders,
   new SlashCommandBuilder()
     .setName("활동초기화")
     .setDescription("서버 활동 데이터를 초기화합니다 (관리자 전용)"),
@@ -229,7 +239,52 @@ client.on("interactionCreate", async (interaction) => {
 
   if (!interaction.isChatInputCommand()) return;
 
-  const { commandName, guild, member } = interaction;
+  if (!interaction.guild) {
+    return interaction.reply({
+      content: "❌ 서버 안에서만 사용할 수 있는 명령어입니다.",
+      ephemeral: true,
+    });
+  }
+
+  const liveMember = await interaction.guild.members
+    .fetch(interaction.user.id)
+    .catch(() => null);
+
+  if (!liveMember) {
+    return interaction.reply({
+      content: "❌ 멤버 정보를 불러오지 못했습니다.",
+      ephemeral: true,
+    });
+  }
+
+  try {
+    const handledBySecuritySuite = await handleSecurityCommand({
+      interaction,
+      guild: interaction.guild,
+      member: liveMember,
+      db,
+    });
+
+    if (handledBySecuritySuite) {
+      return;
+    }
+  } catch (error) {
+    console.error("🚨 보안 명령 처리 오류:", error);
+
+    if (interaction.deferred || interaction.replied) {
+      return interaction
+        .editReply("❌ 보안 명령 처리 중 오류가 발생했습니다.")
+        .catch(() => null);
+    }
+
+    return interaction.reply({
+      content: "❌ 보안 명령 처리 중 오류가 발생했습니다.",
+      ephemeral: true,
+    });
+  }
+
+  const { commandName, guild } = interaction;
+  const member = liveMember;
 // =======================
 // 🎫 /상담신청
 // =======================
@@ -238,7 +293,6 @@ if (commandName === "상담신청") {
   try {
 
     const guild = interaction.guild;
-    const member = interaction.member;
 
     if (!guild || !member) {
       console.log("❌ guild 또는 member 없음");
@@ -388,13 +442,13 @@ ${adminMentions} 상담 요청이 들어왔습니다 🙏`
 if (commandName === "상담종료") {
 
   const ADMIN_ROLE_IDS =
-    process.env.ADMIN_ROLE_IDS.split(",");
+    process.env.ADMIN_ROLE_IDS?.split(",").map(id => id.trim()).filter(Boolean) || [];
 
-  const memberRoles = interaction.member.roles.cache;
+  const memberRoles = member.roles.cache;
 
-  const isAdmin = ADMIN_ROLE_IDS.some(roleId =>
-    memberRoles.has(roleId)
-  );
+  const isAdmin =
+    member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+    ADMIN_ROLE_IDS.some(roleId => memberRoles.has(roleId));
 
   if (!isAdmin) {
     return interaction.reply({
