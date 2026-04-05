@@ -95,6 +95,24 @@ new SlashCommandBuilder()
 new SlashCommandBuilder()
   .setName("상담종료")
   .setDescription("현재 상담을 종료합니다 (관리자)"),
+new SlashCommandBuilder()
+  .setName("영구밴")
+  .setDescription("유저 ID로 서버에서 영구 밴합니다")
+  .addStringOption((option) =>
+    option
+      .setName("user_id")
+      .setDescription("밴할 디스코드 유저 ID")
+      .setRequired(true)
+  )
+  .addStringOption((option) =>
+    option
+      .setName("reason")
+      .setDescription("밴 사유")
+      .setRequired(false)
+  )
+  .setDefaultMemberPermissions(
+    PermissionsBitField.Flags.BanMembers
+  ),
   new SlashCommandBuilder()
     .setName("활동초기화")
     .setDescription("서버 활동 데이터를 초기화합니다 (관리자 전용)"),
@@ -400,6 +418,120 @@ if (commandName === "상담종료") {
     channel.delete();
   }, 3000);
 }
+  // =======================
+  // 🔨 /영구밴
+  // =======================
+  if (commandName === "영구밴") {
+    await interaction.deferReply({ ephemeral: true });
+
+    if (
+      !member.permissions.has(
+        PermissionsBitField.Flags.BanMembers
+      )
+    ) {
+      return interaction.editReply(
+        "⛔ 밴 권한이 있는 관리자만 사용할 수 있습니다."
+      );
+    }
+
+    const botMember =
+      guild.members.me || await guild.members.fetchMe();
+
+    if (
+      !botMember.permissions.has(
+        PermissionsBitField.Flags.BanMembers
+      )
+    ) {
+      return interaction.editReply(
+        "❌ 봇에 밴 권한이 없습니다. 봇 역할에 `멤버 차단하기` 권한을 주세요."
+      );
+    }
+
+    const targetUserId = interaction.options
+      .getString("user_id", true)
+      .trim();
+
+    const reasonInput = interaction.options
+      .getString("reason")
+      ?.trim();
+
+    if (!/^\d{17,20}$/.test(targetUserId)) {
+      return interaction.editReply(
+        "❌ 올바른 디스코드 유저 ID를 입력해주세요."
+      );
+    }
+
+    if (targetUserId === interaction.user.id) {
+      return interaction.editReply(
+        "❌ 자기 자신은 밴할 수 없습니다."
+      );
+    }
+
+    if (targetUserId === guild.ownerId) {
+      return interaction.editReply(
+        "❌ 서버 소유자는 밴할 수 없습니다."
+      );
+    }
+
+    const existingBan = await guild.bans
+      .fetch(targetUserId)
+      .catch(() => null);
+
+    if (existingBan) {
+      return interaction.editReply(
+        `ℹ️ <@${targetUserId}> 님은 이미 밴된 상태입니다.`
+      );
+    }
+
+    const targetMember = await guild.members
+      .fetch(targetUserId)
+      .catch(() => null);
+
+    if (targetMember) {
+      if (targetMember.id === botMember.id) {
+        return interaction.editReply(
+          "❌ 봇 자신은 밴할 수 없습니다."
+        );
+      }
+
+      if (
+        member.id !== guild.ownerId &&
+        targetMember.roles.highest.position >=
+          member.roles.highest.position
+      ) {
+        return interaction.editReply(
+          "❌ 본인보다 높거나 같은 역할의 멤버는 밴할 수 없습니다."
+        );
+      }
+
+      if (!targetMember.bannable) {
+        return interaction.editReply(
+          "❌ 이 유저는 현재 밴할 수 없습니다. 봇 역할이 더 높고 권한이 충분한지 확인해주세요."
+        );
+      }
+    }
+
+    const reason = reasonInput
+      ? `${reasonInput} | 처리자: ${interaction.user.tag} (${interaction.user.id})`
+      : `처리자: ${interaction.user.tag} (${interaction.user.id})`;
+
+    try {
+      await guild.members.ban(targetUserId, {
+        reason,
+        deleteMessageSeconds: 0,
+      });
+
+      return interaction.editReply(
+        `🔨 <@${targetUserId}> 님을 영구 밴했습니다.${reasonInput ? `\n사유: ${reasonInput}` : ""}`
+      );
+    } catch (error) {
+      console.error("🚨 영구 밴 오류:", error);
+
+      return interaction.editReply(
+        "❌ 영구 밴 처리 중 오류가 발생했습니다. 봇 권한과 유저 ID를 다시 확인해주세요."
+      );
+    }
+  }
   // =======================
   // 📊 /내레벨
   // =======================
