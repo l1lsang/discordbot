@@ -611,12 +611,14 @@ if (commandName === "상담종료") {
   // 🏆 /랭킹
   // =======================
   if (commandName === "랭킹") {
-    const snap = await db
+    const usersRef = db
       .collection("guilds")
       .doc(guild.id)
-      .collection("users")
+      .collection("users");
+
+    const snap = await usersRef
       .orderBy("count", "desc")
-      .limit(5)
+      .limit(30)
       .get();
 
     if (snap.empty) {
@@ -625,14 +627,44 @@ if (commandName === "상담종료") {
 
     const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
     let text = "🏆 **서버 활동 랭킹 TOP 5**\n\n";
+    const staleRefs = [];
 
     let i = 0;
     for (const doc of snap.docs) {
-      const m = await guild.members.fetch(doc.id);
+      if (i >= medals.length) break;
+
+      const m =
+        guild.members.cache.get(doc.id) ||
+        await guild.members.fetch(doc.id).catch((error) => {
+          if (error?.code === 10007) {
+            staleRefs.push(doc.ref);
+            return null;
+          }
+
+          console.error("🚨 랭킹 멤버 조회 오류:", error);
+          return null;
+        });
+
+      if (!m) continue;
+
       const data = doc.data();
 
       text += `${medals[i]} ${m.displayName} (Lv.${data.level}) — ${data.count}회\n`;
       i++;
+    }
+
+    if (staleRefs.length > 0) {
+      const batch = db.batch();
+      staleRefs.forEach((ref) => batch.delete(ref));
+      await batch.commit().catch((error) => {
+        console.error("⚠️ 탈퇴 멤버 데이터 정리 실패:", error);
+      });
+    }
+
+    if (i === 0) {
+      return interaction.reply(
+        "표시할 활동 멤버가 없습니다. 잠시 후 다시 시도해주세요."
+      );
     }
 
     return interaction.reply(text);
