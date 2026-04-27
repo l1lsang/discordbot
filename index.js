@@ -1,5 +1,7 @@
 import {
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   GatewayIntentBits,
   PermissionsBitField,
@@ -66,6 +68,7 @@ const CONSULT_TYPE_OPTIONS = [
 registerSecurityHandlers(client, db);
 
 const VOICE_SCORE_UNIT_MS = 60 * 1000;
+const RANKING_PAGE_SIZE = 10;
 const activeVoiceSessions = new Map();
 
 function getVoiceSessionKey(guildId, userId) {
@@ -228,6 +231,204 @@ function clearGuildVoiceSessions(guildId) {
   }
 }
 
+function getRankLabel(rank) {
+  if (rank === 1) return "🥇 1위";
+  if (rank === 2) return "🥈 2위";
+  if (rank === 3) return "🥉 3위";
+  return `${rank}위`;
+}
+
+async function deleteStaleUserRefs(staleRefs) {
+  if (staleRefs.length === 0) return;
+
+  let batch = db.batch();
+  let writes = 0;
+
+  for (const ref of staleRefs) {
+    batch.delete(ref);
+    writes++;
+
+    if (writes === 500) {
+      await batch.commit();
+      batch = db.batch();
+      writes = 0;
+    }
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+}
+
+function buildRankingButtons(type, page, totalPages) {
+  const previousPage = Math.max(0, page - 1);
+  const nextPage = Math.min(totalPages - 1, page + 1);
+
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ranking:${type}:${previousPage}`)
+        .setLabel("이전")
+        .setEmoji("⬅️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page <= 0),
+      new ButtonBuilder()
+        .setCustomId(`ranking:${type}:${nextPage}`)
+        .setLabel("다음")
+        .setEmoji("➡️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page >= totalPages - 1)
+    ),
+  ];
+}
+
+async function getRankedUsers(guild, type) {
+  const usersRef = db
+    .collection("guilds")
+    .doc(guild.id)
+    .collection("users");
+
+  const snap = await usersRef.get();
+
+  if (snap.empty) {
+    return {
+      rankedUsers: [],
+      emptyMessage:
+        type === "voice"
+          ? "아직 음성방 활동 데이터가 없습니다 💤"
+          : "아직 활동 데이터가 없습니다 💤",
+    };
+  }
+
+  const now = Date.now();
+  const staleRefs = [];
+  const rankedUsers = snap.docs
+    .map((doc) => {
+      const data = doc.data();
+      const count = toNumber(data.count);
+      const voiceMs = getEffectiveVoiceMs(data, guild.id, doc.id, now);
+      const activityScore = getActivityScore(count, voiceMs);
+
+      return {
+        doc,
+        count,
+        voiceMs,
+        activityScore,
+        level: getLevel(activityScore),
+      };
+    })
+    .filter((user) =>
+      type === "voice"
+        ? user.voiceMs > 0
+        : user.count > 0 || user.voiceMs > 0
+    )
+    .sort((a, b) => {
+      if (type === "voice") {
+        return b.voiceMs - a.voiceMs;
+      }
+
+      if (b.activityScore !== a.activityScore) {
+        return b.activityScore - a.activityScore;
+      }
+
+      if (b.voiceMs !== a.voiceMs) {
+        return b.voiceMs - a.voiceMs;
+      }
+
+      return b.count - a.count;
+    });
+
+  const visibleUsers = [];
+
+  for (const rankedUser of rankedUsers) {
+    const member =
+      guild.members.cache.get(rankedUser.doc.id) ||
+      await guild.members.fetch(rankedUser.doc.id).catch((error) => {
+        if (error?.code === 10007) {
+          staleRefs.push(rankedUser.doc.ref);
+          return null;
+        }
+
+        console.error("🚨 랭킹 멤버 조회 오류:", error);
+        return null;
+      });
+
+    if (!member) continue;
+
+    visibleUsers.push({
+      ...rankedUser,
+      member,
+    });
+  }
+
+  await deleteStaleUserRefs(staleRefs).catch((error) => {
+    console.error("⚠️ 탈퇴 멤버 데이터 정리 실패:", error);
+  });
+
+  return {
+    rankedUsers: visibleUsers,
+    emptyMessage:
+      type === "voice"
+        ? "아직 음성방 활동 데이터가 없습니다 💤"
+        : "아직 활동 데이터가 없습니다 💤",
+  };
+}
+
+async function buildRankingPage(guild, type, page) {
+  const { rankedUsers, emptyMessage } = await getRankedUsers(guild, type);
+
+  if (rankedUsers.length === 0) {
+    return {
+      content: emptyMessage,
+      components: [],
+    };
+  }
+
+  const totalPages = Math.ceil(rankedUsers.length / RANKING_PAGE_SIZE);
+  const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
+  const startIndex = currentPage * RANKING_PAGE_SIZE;
+  const pageUsers = rankedUsers.slice(
+    startIndex,
+    startIndex + RANKING_PAGE_SIZE
+  );
+  const startRank = startIndex + 1;
+  const endRank = startIndex + pageUsers.length;
+
+  let text =
+    type === "voice"
+      ? `🎙️ **음성방 체류 시간 ${startRank}-${endRank}위**\n`
+      : `🏆 **서버 활동 랭킹 ${startRank}-${endRank}위**\n`;
+
+  if (type === "activity") {
+    text += "채팅 1회 + 음성 1분 = 1점\n";
+  }
+
+  text += `페이지 ${currentPage + 1}/${totalPages}\n\n`;
+
+  pageUsers.forEach((rankedUser, index) => {
+    const rank = startIndex + index + 1;
+
+    if (type === "voice") {
+      const isActive =
+        activeVoiceSessions.has(
+          getVoiceSessionKey(guild.id, rankedUser.doc.id)
+        ) || Boolean(rankedUser.member.voice?.channelId);
+
+      text += `${getRankLabel(rank)} ${rankedUser.member.displayName} — ${formatDuration(rankedUser.voiceMs)}${isActive ? " · 접속 중" : ""}\n`;
+      return;
+    }
+
+    text += `${getRankLabel(rank)} ${rankedUser.member.displayName} (Lv.${rankedUser.level}) — ${rankedUser.activityScore}점 · 채팅 ${rankedUser.count}회 · 음성 ${formatDuration(rankedUser.voiceMs)}\n`;
+  });
+
+  return {
+    content: text,
+    components: totalPages > 1
+      ? buildRankingButtons(type, currentPage, totalPages)
+      : [],
+  };
+}
+
 // =======================
 // 🔢 레벨 계산 함수 (Lv.1 ~ Lv.20)
 // =======================
@@ -260,11 +461,11 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("랭킹")
-    .setDescription("서버 활동 랭킹 TOP 5를 확인합니다"),
+    .setDescription("서버 활동 랭킹을 확인합니다"),
 
   new SlashCommandBuilder()
     .setName("음성방랭킹")
-    .setDescription("음성방 체류 시간 랭킹 TOP 5를 확인합니다"),
+    .setDescription("음성방 체류 시간 랭킹을 확인합니다"),
 
   new SlashCommandBuilder()
     .setName("상담신청")
@@ -450,6 +651,54 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.followUp({
       content: `# ${selectedType} 형식의 상담입니다`,
     });
+  }
+
+  if (
+    interaction.isButton() &&
+    interaction.customId.startsWith("ranking:")
+  ) {
+    if (!interaction.guild) {
+      return interaction.reply({
+        content: "❌ 서버 안에서만 사용할 수 있는 버튼입니다.",
+        ephemeral: true,
+      });
+    }
+
+    const [, type, pageText] = interaction.customId.split(":");
+
+    if (!["activity", "voice"].includes(type)) {
+      return interaction.reply({
+        content: "❌ 알 수 없는 랭킹 버튼입니다.",
+        ephemeral: true,
+      });
+    }
+
+    const page = Math.max(0, Number.parseInt(pageText, 10) || 0);
+
+    try {
+      await interaction.deferUpdate();
+
+      const payload = await buildRankingPage(
+        interaction.guild,
+        type,
+        page
+      );
+
+      return interaction.editReply(payload);
+    } catch (error) {
+      console.error("🚨 랭킹 페이지 버튼 처리 오류:", error);
+
+      const errorPayload = {
+        content: "❌ 랭킹 페이지를 불러오는 중 오류가 발생했습니다.",
+        ephemeral: true,
+      };
+
+      if (interaction.deferred || interaction.replied) {
+        return interaction.followUp(errorPayload);
+      }
+
+      return interaction.reply(errorPayload);
+    }
   }
 
   if (!interaction.isChatInputCommand()) return;
@@ -830,172 +1079,18 @@ if (commandName === "상담종료") {
   // 🏆 /랭킹
   // =======================
   if (commandName === "랭킹") {
-    const usersRef = db
-      .collection("guilds")
-      .doc(guild.id)
-      .collection("users");
-
-    const snap = await usersRef.get();
-
-    if (snap.empty) {
-      return interaction.reply("아직 활동 데이터가 없습니다 💤");
-    }
-
-    const now = Date.now();
-    const rankedUsers = snap.docs
-      .map((doc) => {
-        const data = doc.data();
-        const count = toNumber(data.count);
-        const voiceMs = getEffectiveVoiceMs(data, guild.id, doc.id, now);
-        const activityScore = getActivityScore(count, voiceMs);
-
-        return {
-          doc,
-          count,
-          voiceMs,
-          activityScore,
-          level: getLevel(activityScore),
-        };
-      })
-      .filter((user) => user.count > 0 || user.voiceMs > 0)
-      .sort((a, b) => {
-        if (b.activityScore !== a.activityScore) {
-          return b.activityScore - a.activityScore;
-        }
-
-        if (b.voiceMs !== a.voiceMs) {
-          return b.voiceMs - a.voiceMs;
-        }
-
-        return b.count - a.count;
-      });
-
-    if (rankedUsers.length === 0) {
-      return interaction.reply("아직 활동 데이터가 없습니다 💤");
-    }
-
-    const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
-    let text = "🏆 **서버 활동 랭킹 TOP 5**\n";
-    text += "채팅 1회 + 음성 1분 = 1점\n\n";
-    const staleRefs = [];
-
-    let i = 0;
-    for (const rankedUser of rankedUsers) {
-      if (i >= medals.length) break;
-
-      const m =
-        guild.members.cache.get(rankedUser.doc.id) ||
-        await guild.members.fetch(rankedUser.doc.id).catch((error) => {
-          if (error?.code === 10007) {
-            staleRefs.push(rankedUser.doc.ref);
-            return null;
-          }
-
-          console.error("🚨 랭킹 멤버 조회 오류:", error);
-          return null;
-        });
-
-      if (!m) continue;
-
-      text += `${medals[i]} ${m.displayName} (Lv.${rankedUser.level}) — ${rankedUser.activityScore}점 · 채팅 ${rankedUser.count}회 · 음성 ${formatDuration(rankedUser.voiceMs)}\n`;
-      i++;
-    }
-
-    if (staleRefs.length > 0) {
-      const batch = db.batch();
-      staleRefs.forEach((ref) => batch.delete(ref));
-      await batch.commit().catch((error) => {
-        console.error("⚠️ 탈퇴 멤버 데이터 정리 실패:", error);
-      });
-    }
-
-    if (i === 0) {
-      return interaction.reply(
-        "표시할 활동 멤버가 없습니다. 잠시 후 다시 시도해주세요."
-      );
-    }
-
-    return interaction.reply(text);
+    await interaction.deferReply();
+    const payload = await buildRankingPage(guild, "activity", 0);
+    return interaction.editReply(payload);
   }
 
   // =======================
   // 🎙️ /음성방랭킹
   // =======================
   if (commandName === "음성방랭킹") {
-    const usersRef = db
-      .collection("guilds")
-      .doc(guild.id)
-      .collection("users");
-
-    const snap = await usersRef.get();
-
-    if (snap.empty) {
-      return interaction.reply("아직 음성방 활동 데이터가 없습니다 💤");
-    }
-
-    const now = Date.now();
-    const rankedUsers = snap.docs
-      .map((doc) => {
-        const data = doc.data();
-        const voiceMs = getEffectiveVoiceMs(data, guild.id, doc.id, now);
-
-        return {
-          doc,
-          voiceMs,
-        };
-      })
-      .filter((user) => user.voiceMs > 0)
-      .sort((a, b) => b.voiceMs - a.voiceMs);
-
-    if (rankedUsers.length === 0) {
-      return interaction.reply("아직 음성방 활동 데이터가 없습니다 💤");
-    }
-
-    const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
-    let text = "🎙️ **음성방 체류 시간 TOP 5**\n\n";
-    const staleRefs = [];
-
-    let i = 0;
-    for (const rankedUser of rankedUsers) {
-      if (i >= medals.length) break;
-
-      const m =
-        guild.members.cache.get(rankedUser.doc.id) ||
-        await guild.members.fetch(rankedUser.doc.id).catch((error) => {
-          if (error?.code === 10007) {
-            staleRefs.push(rankedUser.doc.ref);
-            return null;
-          }
-
-          console.error("🚨 음성방 랭킹 멤버 조회 오류:", error);
-          return null;
-        });
-
-      if (!m) continue;
-
-      const isActive = activeVoiceSessions.has(
-        getVoiceSessionKey(guild.id, rankedUser.doc.id)
-      ) || Boolean(m.voice?.channelId);
-
-      text += `${medals[i]} ${m.displayName} — ${formatDuration(rankedUser.voiceMs)}${isActive ? " · 접속 중" : ""}\n`;
-      i++;
-    }
-
-    if (staleRefs.length > 0) {
-      const batch = db.batch();
-      staleRefs.forEach((ref) => batch.delete(ref));
-      await batch.commit().catch((error) => {
-        console.error("⚠️ 탈퇴 멤버 음성방 데이터 정리 실패:", error);
-      });
-    }
-
-    if (i === 0) {
-      return interaction.reply(
-        "표시할 음성방 활동 멤버가 없습니다. 잠시 후 다시 시도해주세요."
-      );
-    }
-
-    return interaction.reply(text);
+    await interaction.deferReply();
+    const payload = await buildRankingPage(guild, "voice", 0);
+    return interaction.editReply(payload);
   }
 
   // =======================
