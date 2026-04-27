@@ -3,6 +3,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   Client,
+  EmbedBuilder,
   GatewayIntentBits,
   PermissionsBitField,
   SlashCommandBuilder,
@@ -65,6 +66,10 @@ const CONSULT_TYPE_OPTIONS = [
   "기타",
 ];
 
+const DEFAULT_LEAVE_LOG_MESSAGE = "{user} 님이 서버를 떠났습니다.";
+const USER_MENTION_TOKEN_PATTERN =
+  /\{(?:user|mention|tag|username|displayName)\}/;
+
 registerSecurityHandlers(client, db);
 
 const VOICE_SCORE_UNIT_MS = 60 * 1000;
@@ -73,6 +78,80 @@ const activeVoiceSessions = new Map();
 
 function getVoiceSessionKey(guildId, userId) {
   return `${guildId}:${userId}`;
+}
+
+function leaveLogConfigRef(guildId) {
+  return db
+    .collection("guilds")
+    .doc(guildId)
+    .collection("config")
+    .doc("leaveLog");
+}
+
+function normalizeLeaveLogConfig(data = {}) {
+  const message =
+    typeof data.message === "string" && data.message.trim()
+      ? data.message.trim()
+      : DEFAULT_LEAVE_LOG_MESSAGE;
+
+  return {
+    channelId: data.channelId || null,
+    message,
+  };
+}
+
+async function getLeaveLogConfig(guildId) {
+  const snap = await leaveLogConfigRef(guildId).get();
+  return normalizeLeaveLogConfig(snap.exists ? snap.data() : {});
+}
+
+async function saveLeaveLogConfig(guildId, patch) {
+  await leaveLogConfigRef(guildId).set(patch, { merge: true });
+  return getLeaveLogConfig(guildId);
+}
+
+async function resolveLeaveLogChannel(guild, channelId) {
+  if (!channelId) return null;
+
+  const cached = guild.channels.cache.get(channelId);
+  if (cached?.isTextBased()) return cached;
+
+  const fetched = await guild.channels.fetch(channelId).catch(() => null);
+  return fetched?.isTextBased() ? fetched : null;
+}
+
+function replaceAllText(text, search, replacement) {
+  return text.split(search).join(replacement);
+}
+
+function formatLeaveLogMessage(template, member) {
+  const mention = `<@${member.id}>`;
+  const joinedAt = member.joinedTimestamp
+    ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`
+    : "알 수 없음";
+
+  let message = template.trim() || DEFAULT_LEAVE_LOG_MESSAGE;
+  const hasUserMarker =
+    USER_MENTION_TOKEN_PATTERN.test(message) || message.includes("@님");
+
+  const replacements = {
+    "{user}": mention,
+    "{mention}": mention,
+    "{tag}": member.user.tag,
+    "{username}": member.user.username,
+    "{displayName}": member.displayName || member.user.username,
+    "{server}": member.guild.name,
+    "{memberCount}": `${member.guild.memberCount}`,
+    "{joinedAt}": joinedAt,
+  };
+
+  message = replaceAllText(message, "@님", `${mention}님`);
+
+  for (const [token, value] of Object.entries(replacements)) {
+    message = replaceAllText(message, token, value);
+  }
+
+  return hasUserMarker ? message : `${mention} ${message}`;
 }
 
 function toNumber(value, fallback = 0) {
@@ -474,6 +553,26 @@ const commands = [
   new SlashCommandBuilder()
     .setName("상담종료")
     .setDescription("현재 상담을 종료합니다 (관리자)"),
+
+  new SlashCommandBuilder()
+    .setName("퇴장로그")
+    .setDescription("퇴장 로그 채널과 로그멘트를 설정합니다")
+    .addChannelOption((option) =>
+      option
+        .setName("채널")
+        .setDescription("퇴장 로그를 보낼 채널")
+        .setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("로그멘트")
+        .setDescription("예: {user} 님이 서버를 떠났습니다")
+        .setRequired(true)
+        .setMaxLength(500)
+    )
+    .setDefaultMemberPermissions(
+      PermissionsBitField.Flags.Administrator
+    ),
   new SlashCommandBuilder()
     .setName("영구밴")
     .setDescription("유저 ID로 서버에서 영구 밴합니다")
@@ -607,6 +706,72 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     }
   } catch (error) {
     console.error("🚨 음성방 시간 기록 오류:", error);
+  }
+});
+
+// =======================
+// 🚪 퇴장 로그 카드
+// =======================
+client.on("guildMemberRemove", async (member) => {
+  try {
+    const config = await getLeaveLogConfig(member.guild.id);
+    if (!config.channelId) return;
+
+    const channel = await resolveLeaveLogChannel(
+      member.guild,
+      config.channelId
+    );
+
+    if (!channel) return;
+
+    const avatarUrl = member.user.displayAvatarURL({
+      extension: "png",
+      size: 256,
+    });
+    const joinedAt = member.joinedTimestamp
+      ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`
+      : "알 수 없음";
+    const message = formatLeaveLogMessage(config.message, member);
+
+    const embed = new EmbedBuilder()
+      .setColor(0xf54d4d)
+      .setAuthor({
+        name: `${member.user.tag} 퇴장`,
+        iconURL: avatarUrl,
+      })
+      .setTitle("멤버 퇴장 로그")
+      .setDescription(message)
+      .setThumbnail(avatarUrl)
+      .addFields(
+        {
+          name: "유저",
+          value: `${member.user.tag}\n${member.id}`,
+          inline: true,
+        },
+        {
+          name: "서버 인원",
+          value: `${member.guild.memberCount}명`,
+          inline: true,
+        },
+        {
+          name: "가입일",
+          value: joinedAt,
+          inline: true,
+        }
+      )
+      .setFooter({ text: member.guild.name })
+      .setTimestamp();
+
+    await channel.send({
+      embeds: [embed],
+      allowedMentions: {
+        users: [member.id],
+        roles: [],
+        parse: [],
+      },
+    });
+  } catch (error) {
+    console.error("🚨 퇴장 로그 전송 오류:", error);
   }
 });
 
@@ -749,6 +914,75 @@ client.on("interactionCreate", async (interaction) => {
 
   const { commandName, guild } = interaction;
   const member = liveMember;
+
+  // =======================
+  // 🚪 /퇴장로그
+  // =======================
+  if (commandName === "퇴장로그") {
+    if (
+      !member.permissions.has(
+        PermissionsBitField.Flags.Administrator
+      )
+    ) {
+      return interaction.reply({
+        content: "⛔ 관리자만 퇴장 로그를 설정할 수 있습니다.",
+        ephemeral: true,
+      });
+    }
+
+    const channel = interaction.options.getChannel("채널", true);
+    const message = interaction.options
+      .getString("로그멘트", true)
+      .trim();
+
+    if (!channel.isTextBased()) {
+      return interaction.reply({
+        content: "❌ 텍스트 채널만 퇴장 로그 채널로 지정할 수 있습니다.",
+        ephemeral: true,
+      });
+    }
+
+    if (!message) {
+      return interaction.reply({
+        content: "❌ 로그멘트를 입력해주세요.",
+        ephemeral: true,
+      });
+    }
+
+    const botMember =
+      guild.members.me || await guild.members.fetchMe();
+    const botPermissions = channel.permissionsFor(botMember);
+
+    if (
+      !botPermissions?.has(PermissionsBitField.Flags.ViewChannel) ||
+      !botPermissions.has(PermissionsBitField.Flags.SendMessages) ||
+      !botPermissions.has(PermissionsBitField.Flags.EmbedLinks)
+    ) {
+      return interaction.reply({
+        content:
+          "❌ 봇이 해당 채널에 카드 로그를 보낼 수 없습니다. `채널 보기`, `메시지 보내기`, `링크 임베드` 권한을 확인해주세요.",
+        ephemeral: true,
+      });
+    }
+
+    const config = await saveLeaveLogConfig(guild.id, {
+      channelId: channel.id,
+      message,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: interaction.user.id,
+    });
+
+    const preview = formatLeaveLogMessage(config.message, member);
+
+    return interaction.reply({
+      content: [
+        `✅ 퇴장 로그 채널을 ${channel} 로 설정했습니다.`,
+        `로그멘트 미리보기: ${preview}`,
+        "사용 가능 치환값: `{user}`, `{tag}`, `{username}`, `{displayName}`, `{server}`, `{memberCount}`, `{joinedAt}`",
+      ].join("\n"),
+      ephemeral: true,
+    });
+  }
 // =======================
 // 🎫 /상담신청
 // =======================
