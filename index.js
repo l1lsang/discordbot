@@ -50,6 +50,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent,
   ],
 });
@@ -63,6 +64,169 @@ const CONSULT_TYPE_OPTIONS = [
 ];
 
 registerSecurityHandlers(client, db);
+
+const VOICE_SCORE_UNIT_MS = 60 * 1000;
+const activeVoiceSessions = new Map();
+
+function getVoiceSessionKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function toNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function timestampToMillis(value) {
+  if (!value) return null;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  if (typeof value.seconds === "number") {
+    return value.seconds * 1000 + Math.floor((value.nanoseconds || 0) / 1000000);
+  }
+  return null;
+}
+
+function getActivityScore(count, voiceMs) {
+  return toNumber(count) + Math.floor(toNumber(voiceMs) / VOICE_SCORE_UNIT_MS);
+}
+
+function getEffectiveVoiceMs(data, guildId, userId, now = Date.now()) {
+  const voiceMs = toNumber(data?.voiceMs);
+  const sessionKey = getVoiceSessionKey(guildId, userId);
+  const memoryStartedAt = activeVoiceSessions.get(sessionKey);
+  const storedStartedAt = timestampToMillis(data?.voiceSessionStartedAt);
+  const startedAt = memoryStartedAt || storedStartedAt;
+
+  if (!startedAt) return voiceMs;
+  return voiceMs + Math.max(0, now - startedAt);
+}
+
+function formatDuration(ms) {
+  const totalMinutes = Math.floor(toNumber(ms) / 60000);
+
+  if (totalMinutes <= 0) {
+    return "1분 미만";
+  }
+
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) {
+    return `${days}일 ${hours}시간 ${minutes}분`;
+  }
+
+  if (hours > 0) {
+    return `${hours}시간 ${minutes}분`;
+  }
+
+  return `${minutes}분`;
+}
+
+async function startVoiceSession(guildId, userId, startedAtMs = Date.now()) {
+  const sessionKey = getVoiceSessionKey(guildId, userId);
+
+  activeVoiceSessions.set(sessionKey, startedAtMs);
+
+  await db
+    .collection("guilds")
+    .doc(guildId)
+    .collection("users")
+    .doc(userId)
+    .set(
+      {
+        voiceSessionStartedAt: admin.firestore.Timestamp.fromMillis(startedAtMs),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+}
+
+async function endVoiceSession(guildId, userId, endedAtMs = Date.now()) {
+  const sessionKey = getVoiceSessionKey(guildId, userId);
+  const memoryStartedAt = activeVoiceSessions.get(sessionKey);
+
+  activeVoiceSessions.delete(sessionKey);
+
+  const userRef = db
+    .collection("guilds")
+    .doc(guildId)
+    .collection("users")
+    .doc(userId);
+
+  await db.runTransaction(async (transaction) => {
+    const snap = await transaction.get(userRef);
+    const data = snap.exists ? snap.data() : {};
+    const storedStartedAt = timestampToMillis(data.voiceSessionStartedAt);
+    const startedAt = memoryStartedAt || storedStartedAt || endedAtMs;
+    const sessionMs = Math.max(0, endedAtMs - startedAt);
+    const count = toNumber(data.count);
+    const voiceMs = toNumber(data.voiceMs) + sessionMs;
+    const activityScore = getActivityScore(count, voiceMs);
+
+    transaction.set(
+      userRef,
+      {
+        count,
+        voiceMs,
+        activityScore,
+        level: getLevel(activityScore),
+        voiceSessionStartedAt: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+async function trackCurrentVoiceSessionsForGuild(guild, startedAtMs = Date.now()) {
+  let batch = db.batch();
+  let writes = 0;
+
+  for (const voiceState of guild.voiceStates.cache.values()) {
+    if (!voiceState.channelId) continue;
+    if (voiceState.member?.user?.bot) continue;
+
+    const sessionKey = getVoiceSessionKey(guild.id, voiceState.id);
+    activeVoiceSessions.set(sessionKey, startedAtMs);
+
+    const userRef = db
+      .collection("guilds")
+      .doc(guild.id)
+      .collection("users")
+      .doc(voiceState.id);
+
+    batch.set(
+      userRef,
+      {
+        voiceSessionStartedAt: admin.firestore.Timestamp.fromMillis(startedAtMs),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    writes++;
+
+    if (writes === 500) {
+      await batch.commit();
+      batch = db.batch();
+      writes = 0;
+    }
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+}
+
+function clearGuildVoiceSessions(guildId) {
+  for (const sessionKey of activeVoiceSessions.keys()) {
+    if (sessionKey.startsWith(`${guildId}:`)) {
+      activeVoiceSessions.delete(sessionKey);
+    }
+  }
+}
 
 // =======================
 // 🔢 레벨 계산 함수 (Lv.1 ~ Lv.20)
@@ -97,31 +261,36 @@ const commands = [
   new SlashCommandBuilder()
     .setName("랭킹")
     .setDescription("서버 활동 랭킹 TOP 5를 확인합니다"),
-new SlashCommandBuilder()
-  .setName("상담신청")
-  .setDescription("관리자에게 상담을 요청합니다"),
 
-new SlashCommandBuilder()
-  .setName("상담종료")
-  .setDescription("현재 상담을 종료합니다 (관리자)"),
-new SlashCommandBuilder()
-  .setName("영구밴")
-  .setDescription("유저 ID로 서버에서 영구 밴합니다")
-  .addStringOption((option) =>
-    option
-      .setName("user_id")
-      .setDescription("밴할 디스코드 유저 ID")
-      .setRequired(true)
-  )
-  .addStringOption((option) =>
-    option
-      .setName("reason")
-      .setDescription("밴 사유")
-      .setRequired(false)
-  )
-  .setDefaultMemberPermissions(
-    PermissionsBitField.Flags.BanMembers
-  ),
+  new SlashCommandBuilder()
+    .setName("음성방랭킹")
+    .setDescription("음성방 체류 시간 랭킹 TOP 5를 확인합니다"),
+
+  new SlashCommandBuilder()
+    .setName("상담신청")
+    .setDescription("관리자에게 상담을 요청합니다"),
+
+  new SlashCommandBuilder()
+    .setName("상담종료")
+    .setDescription("현재 상담을 종료합니다 (관리자)"),
+  new SlashCommandBuilder()
+    .setName("영구밴")
+    .setDescription("유저 ID로 서버에서 영구 밴합니다")
+    .addStringOption((option) =>
+      option
+        .setName("user_id")
+        .setDescription("밴할 디스코드 유저 ID")
+        .setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("reason")
+        .setDescription("밴 사유")
+        .setRequired(false)
+    )
+    .setDefaultMemberPermissions(
+      PermissionsBitField.Flags.BanMembers
+    ),
   ...securityCommandBuilders,
   new SlashCommandBuilder()
     .setName("활동초기화")
@@ -154,6 +323,12 @@ client.on("ready", async () => {
     ],
     status: "online",
   });
+
+  for (const guild of client.guilds.cache.values()) {
+    await trackCurrentVoiceSessionsForGuild(guild).catch((error) => {
+      console.error("⚠️ 현재 음성방 세션 동기화 실패:", error);
+    });
+  }
 });
 
 // =======================
@@ -172,26 +347,66 @@ client.on("messageCreate", async (message) => {
     .collection("users")
     .doc(userId);
 
-  const snap = await userRef.get();
+  let count = 0;
+  let level = 1;
+  let levelUp = false;
 
-  const prev = snap.exists
-    ? snap.data()
-    : { count: 0, level: 1 };
+  await db.runTransaction(async (transaction) => {
+    const snap = await transaction.get(userRef);
+    const prev = snap.exists
+      ? snap.data()
+      : { count: 0, level: 1, voiceMs: 0 };
 
-  const count = prev.count + 1;
-  const level = getLevel(count);
+    count = toNumber(prev.count) + 1;
+    const voiceMs = toNumber(prev.voiceMs);
+    const activityScore = getActivityScore(count, voiceMs);
+    level = getLevel(activityScore);
+    levelUp = level > toNumber(prev.level, 1);
 
-  if (level > prev.level) {
+    transaction.set(
+      userRef,
+      {
+        count,
+        voiceMs,
+        activityScore,
+        level,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+
+  if (levelUp) {
     message.channel.send(
       `🎉 ${message.member.displayName} 님이 **Lv.${level}** 달성!`
     );
   }
+});
 
-  await userRef.set({
-    count,
-    level,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+// =======================
+// 🎙️ 음성방 체류 시간 측정
+// =======================
+client.on("voiceStateUpdate", async (oldState, newState) => {
+  const member = newState.member || oldState.member;
+  if (!member || member.user.bot) return;
+
+  const guildId = newState.guild.id;
+  const userId = member.id;
+  const joinedVoice = !oldState.channelId && Boolean(newState.channelId);
+  const leftVoice = Boolean(oldState.channelId) && !newState.channelId;
+
+  try {
+    if (joinedVoice) {
+      await startVoiceSession(guildId, userId);
+      return;
+    }
+
+    if (leftVoice) {
+      await endVoiceSession(guildId, userId);
+    }
+  } catch (error) {
+    console.error("🚨 음성방 시간 기록 오류:", error);
+  }
 });
 
 // =======================
@@ -599,10 +814,14 @@ if (commandName === "상담종료") {
     const snap = await userRef.get();
     const stat = snap.exists
       ? snap.data()
-      : { count: 0, level: 1 };
+      : { count: 0, level: 1, voiceMs: 0 };
+    const voiceMs = getEffectiveVoiceMs(stat, guild.id, member.id);
+    const count = toNumber(stat.count);
+    const activityScore = getActivityScore(count, voiceMs);
+    const level = getLevel(activityScore);
 
     return interaction.reply({
-      content: `📊 **${member.displayName}**\nLv.${stat.level} / 메시지 ${stat.count}`,
+      content: `📊 **${member.displayName}**\nLv.${level} / 활동점수 ${activityScore}점\n채팅 ${count}회 · 음성 ${formatDuration(voiceMs)}`,
       ephemeral: true,
     });
   }
@@ -616,28 +835,59 @@ if (commandName === "상담종료") {
       .doc(guild.id)
       .collection("users");
 
-    const snap = await usersRef
-      .orderBy("count", "desc")
-      .limit(30)
-      .get();
+    const snap = await usersRef.get();
 
     if (snap.empty) {
       return interaction.reply("아직 활동 데이터가 없습니다 💤");
     }
 
+    const now = Date.now();
+    const rankedUsers = snap.docs
+      .map((doc) => {
+        const data = doc.data();
+        const count = toNumber(data.count);
+        const voiceMs = getEffectiveVoiceMs(data, guild.id, doc.id, now);
+        const activityScore = getActivityScore(count, voiceMs);
+
+        return {
+          doc,
+          count,
+          voiceMs,
+          activityScore,
+          level: getLevel(activityScore),
+        };
+      })
+      .filter((user) => user.count > 0 || user.voiceMs > 0)
+      .sort((a, b) => {
+        if (b.activityScore !== a.activityScore) {
+          return b.activityScore - a.activityScore;
+        }
+
+        if (b.voiceMs !== a.voiceMs) {
+          return b.voiceMs - a.voiceMs;
+        }
+
+        return b.count - a.count;
+      });
+
+    if (rankedUsers.length === 0) {
+      return interaction.reply("아직 활동 데이터가 없습니다 💤");
+    }
+
     const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
-    let text = "🏆 **서버 활동 랭킹 TOP 5**\n\n";
+    let text = "🏆 **서버 활동 랭킹 TOP 5**\n";
+    text += "채팅 1회 + 음성 1분 = 1점\n\n";
     const staleRefs = [];
 
     let i = 0;
-    for (const doc of snap.docs) {
+    for (const rankedUser of rankedUsers) {
       if (i >= medals.length) break;
 
       const m =
-        guild.members.cache.get(doc.id) ||
-        await guild.members.fetch(doc.id).catch((error) => {
+        guild.members.cache.get(rankedUser.doc.id) ||
+        await guild.members.fetch(rankedUser.doc.id).catch((error) => {
           if (error?.code === 10007) {
-            staleRefs.push(doc.ref);
+            staleRefs.push(rankedUser.doc.ref);
             return null;
           }
 
@@ -647,9 +897,7 @@ if (commandName === "상담종료") {
 
       if (!m) continue;
 
-      const data = doc.data();
-
-      text += `${medals[i]} ${m.displayName} (Lv.${data.level}) — ${data.count}회\n`;
+      text += `${medals[i]} ${m.displayName} (Lv.${rankedUser.level}) — ${rankedUser.activityScore}점 · 채팅 ${rankedUser.count}회 · 음성 ${formatDuration(rankedUser.voiceMs)}\n`;
       i++;
     }
 
@@ -664,6 +912,86 @@ if (commandName === "상담종료") {
     if (i === 0) {
       return interaction.reply(
         "표시할 활동 멤버가 없습니다. 잠시 후 다시 시도해주세요."
+      );
+    }
+
+    return interaction.reply(text);
+  }
+
+  // =======================
+  // 🎙️ /음성방랭킹
+  // =======================
+  if (commandName === "음성방랭킹") {
+    const usersRef = db
+      .collection("guilds")
+      .doc(guild.id)
+      .collection("users");
+
+    const snap = await usersRef.get();
+
+    if (snap.empty) {
+      return interaction.reply("아직 음성방 활동 데이터가 없습니다 💤");
+    }
+
+    const now = Date.now();
+    const rankedUsers = snap.docs
+      .map((doc) => {
+        const data = doc.data();
+        const voiceMs = getEffectiveVoiceMs(data, guild.id, doc.id, now);
+
+        return {
+          doc,
+          voiceMs,
+        };
+      })
+      .filter((user) => user.voiceMs > 0)
+      .sort((a, b) => b.voiceMs - a.voiceMs);
+
+    if (rankedUsers.length === 0) {
+      return interaction.reply("아직 음성방 활동 데이터가 없습니다 💤");
+    }
+
+    const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
+    let text = "🎙️ **음성방 체류 시간 TOP 5**\n\n";
+    const staleRefs = [];
+
+    let i = 0;
+    for (const rankedUser of rankedUsers) {
+      if (i >= medals.length) break;
+
+      const m =
+        guild.members.cache.get(rankedUser.doc.id) ||
+        await guild.members.fetch(rankedUser.doc.id).catch((error) => {
+          if (error?.code === 10007) {
+            staleRefs.push(rankedUser.doc.ref);
+            return null;
+          }
+
+          console.error("🚨 음성방 랭킹 멤버 조회 오류:", error);
+          return null;
+        });
+
+      if (!m) continue;
+
+      const isActive = activeVoiceSessions.has(
+        getVoiceSessionKey(guild.id, rankedUser.doc.id)
+      ) || Boolean(m.voice?.channelId);
+
+      text += `${medals[i]} ${m.displayName} — ${formatDuration(rankedUser.voiceMs)}${isActive ? " · 접속 중" : ""}\n`;
+      i++;
+    }
+
+    if (staleRefs.length > 0) {
+      const batch = db.batch();
+      staleRefs.forEach((ref) => batch.delete(ref));
+      await batch.commit().catch((error) => {
+        console.error("⚠️ 탈퇴 멤버 음성방 데이터 정리 실패:", error);
+      });
+    }
+
+    if (i === 0) {
+      return interaction.reply(
+        "표시할 음성방 활동 멤버가 없습니다. 잠시 후 다시 시도해주세요."
       );
     }
 
@@ -696,6 +1024,9 @@ if (commandName === "상담종료") {
     snap.forEach(doc => batch.delete(doc.ref));
     await batch.commit();
 
+    clearGuildVoiceSessions(guild.id);
+    await trackCurrentVoiceSessionsForGuild(guild);
+
     return interaction.reply(
       "🧹 서버 활동 데이터가 초기화되었습니다."
     );
@@ -712,13 +1043,33 @@ app.get("/api/stats/:guildId", async (req, res) => {
     .collection("guilds")
     .doc(guildId)
     .collection("users")
-    .orderBy("count", "desc")
     .get();
 
-  const data = snap.docs.map(doc => ({
-    userId: doc.id,
-    ...doc.data(),
-  }));
+  const now = Date.now();
+  const data = snap.docs
+    .map((doc) => {
+      const rawData = doc.data();
+      const count = toNumber(rawData.count);
+      const voiceMs = getEffectiveVoiceMs(rawData, guildId, doc.id, now);
+      const activityScore = getActivityScore(count, voiceMs);
+
+      return {
+        userId: doc.id,
+        ...rawData,
+        count,
+        voiceMs,
+        voiceTime: formatDuration(voiceMs),
+        activityScore,
+        level: getLevel(activityScore),
+      };
+    })
+    .sort((a, b) => {
+      if (b.activityScore !== a.activityScore) {
+        return b.activityScore - a.activityScore;
+      }
+
+      return b.voiceMs - a.voiceMs;
+    });
 
   res.json(data);
 });
