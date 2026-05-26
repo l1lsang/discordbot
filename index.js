@@ -74,6 +74,15 @@ registerSecurityHandlers(client, db);
 
 const VOICE_SCORE_UNIT_MS = 60 * 1000;
 const RANKING_PAGE_SIZE = 10;
+const RANKING_TYPES = new Set(["activity", "voice", "bump"]);
+const DISBOARD_BOT_IDS = new Set(
+  (process.env.DISBOARD_BOT_IDS ||
+    process.env.DISBOARD_BOT_ID ||
+    "302050872383242240")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 const activeVoiceSessions = new Map();
 
 function getVoiceSessionKey(guildId, userId) {
@@ -204,6 +213,177 @@ function formatDuration(ms) {
   }
 
   return `${minutes}분`;
+}
+
+function formatDiscordRelativeTime(value) {
+  const millis = timestampToMillis(value);
+  if (!millis) return null;
+
+  return `<t:${Math.floor(millis / 1000)}:R>`;
+}
+
+function getMessageSearchText(message) {
+  const embedTexts = message.embeds.flatMap((embed) => [
+    embed.title,
+    embed.description,
+    embed.author?.name,
+    embed.footer?.text,
+    ...(embed.fields?.flatMap((field) => [field.name, field.value]) || []),
+  ]);
+
+  return [message.content, ...embedTexts].filter(Boolean).join("\n");
+}
+
+function isDisboardBumpDoneMessage(message) {
+  if (!message.guild || !DISBOARD_BOT_IDS.has(message.author.id)) {
+    return false;
+  }
+
+  const text = getMessageSearchText(message).toLowerCase();
+
+  return (
+    /\bbump done\b/.test(text) ||
+    /\bsuccessfully bumped\b/.test(text) ||
+    /\bbumped successfully\b/.test(text) ||
+    /\bthanks for bumping\b/.test(text)
+  );
+}
+
+function resolveDisboardBumperId(message) {
+  const interactionUserId =
+    message.interactionMetadata?.user?.id ||
+    message.interactionMetadata?.triggeringInteractionMetadata?.user?.id ||
+    message.interaction?.user?.id;
+
+  if (interactionUserId && interactionUserId !== message.author.id) {
+    return interactionUserId;
+  }
+
+  const mentionedUser = message.mentions.users.find(
+    (user) => !user.bot && user.id !== message.author.id
+  );
+
+  if (mentionedUser) {
+    return mentionedUser.id;
+  }
+
+  const mentionMatch = getMessageSearchText(message).match(/<@!?(\d{17,20})>/);
+  return mentionMatch?.[1] || null;
+}
+
+async function recordDisboardBump(message) {
+  if (!isDisboardBumpDoneMessage(message)) {
+    return false;
+  }
+
+  const bumperId = resolveDisboardBumperId(message);
+
+  if (!bumperId) {
+    console.warn("⚠️ DISBOARD bump 유저를 찾지 못했습니다:", message.id);
+    return false;
+  }
+
+  const member =
+    message.guild.members.cache.get(bumperId) ||
+    await message.guild.members.fetch(bumperId).catch(() => null);
+
+  if (!member || member.user.bot) {
+    return false;
+  }
+
+  const userRef = db
+    .collection("guilds")
+    .doc(message.guild.id)
+    .collection("users")
+    .doc(member.id);
+
+  let bumpCount = 0;
+  let alreadyRecorded = false;
+
+  await db.runTransaction(async (transaction) => {
+    const snap = await transaction.get(userRef);
+    const prev = snap.exists ? snap.data() : {};
+
+    if (prev.lastBumpMessageId === message.id) {
+      bumpCount = toNumber(prev.bumpCount);
+      alreadyRecorded = true;
+      return;
+    }
+
+    bumpCount = toNumber(prev.bumpCount) + 1;
+
+    transaction.set(
+      userRef,
+      {
+        bumpCount,
+        lastBumpedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastBumpMessageId: message.id,
+        lastBumpChannelId: message.channelId,
+        bumpUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+
+  if (!alreadyRecorded) {
+    console.log(
+      `🚀 DISBOARD bump 기록: ${message.guild.name} / ${member.user.tag} (${bumpCount}회)`
+    );
+  }
+
+  return true;
+}
+
+async function resetBumpStats(guildId) {
+  const usersRef = db
+    .collection("guilds")
+    .doc(guildId)
+    .collection("users");
+
+  const snap = await usersRef.get();
+  let batch = db.batch();
+  let writes = 0;
+  let resetCount = 0;
+
+  for (const doc of snap.docs) {
+    const data = doc.data();
+
+    if (
+      toNumber(data.bumpCount) <= 0 &&
+      !data.lastBumpedAt &&
+      !data.lastBumpMessageId
+    ) {
+      continue;
+    }
+
+    batch.set(
+      doc.ref,
+      {
+        bumpCount: 0,
+        lastBumpedAt: admin.firestore.FieldValue.delete(),
+        lastBumpMessageId: admin.firestore.FieldValue.delete(),
+        lastBumpChannelId: admin.firestore.FieldValue.delete(),
+        bumpUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    writes++;
+    resetCount++;
+
+    if (writes === 500) {
+      await batch.commit();
+      batch = db.batch();
+      writes = 0;
+    }
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+
+  return resetCount;
 }
 
 async function startVoiceSession(guildId, userId, startedAtMs = Date.now()) {
@@ -375,6 +555,8 @@ async function getRankedUsers(guild, type) {
       emptyMessage:
         type === "voice"
           ? "아직 음성방 활동 데이터가 없습니다 💤"
+          : type === "bump"
+            ? "아직 DISBOARD bump 기록이 없습니다 💤"
           : "아직 활동 데이터가 없습니다 💤",
     };
   }
@@ -387,6 +569,7 @@ async function getRankedUsers(guild, type) {
       const count = toNumber(data.count);
       const voiceMs = getEffectiveVoiceMs(data, guild.id, doc.id, now);
       const activityScore = getActivityScore(count, voiceMs);
+      const bumpCount = toNumber(data.bumpCount);
 
       return {
         doc,
@@ -394,16 +577,29 @@ async function getRankedUsers(guild, type) {
         voiceMs,
         activityScore,
         level: getLevel(activityScore),
+        bumpCount,
+        lastBumpedAt: data.lastBumpedAt,
       };
     })
-    .filter((user) =>
-      type === "voice"
-        ? user.voiceMs > 0
-        : user.count > 0 || user.voiceMs > 0
-    )
+    .filter((user) => {
+      if (type === "voice") return user.voiceMs > 0;
+      if (type === "bump") return user.bumpCount > 0;
+      return user.count > 0 || user.voiceMs > 0;
+    })
     .sort((a, b) => {
       if (type === "voice") {
         return b.voiceMs - a.voiceMs;
+      }
+
+      if (type === "bump") {
+        if (b.bumpCount !== a.bumpCount) {
+          return b.bumpCount - a.bumpCount;
+        }
+
+        return (
+          toNumber(timestampToMillis(b.lastBumpedAt)) -
+          toNumber(timestampToMillis(a.lastBumpedAt))
+        );
       }
 
       if (b.activityScore !== a.activityScore) {
@@ -449,6 +645,8 @@ async function getRankedUsers(guild, type) {
     emptyMessage:
       type === "voice"
         ? "아직 음성방 활동 데이터가 없습니다 💤"
+        : type === "bump"
+          ? "아직 DISBOARD bump 기록이 없습니다 💤"
         : "아직 활동 데이터가 없습니다 💤",
   };
 }
@@ -473,10 +671,15 @@ async function buildRankingPage(guild, type, page) {
   const startRank = startIndex + 1;
   const endRank = startIndex + pageUsers.length;
 
-  let text =
-    type === "voice"
-      ? `🎙️ **음성방 체류 시간 ${startRank}-${endRank}위**\n`
-      : `🏆 **서버 활동 랭킹 ${startRank}-${endRank}위**\n`;
+  let text;
+
+  if (type === "voice") {
+    text = `🎙️ **음성방 체류 시간 ${startRank}-${endRank}위**\n`;
+  } else if (type === "bump") {
+    text = `🚀 **DISBOARD bump 랭킹 ${startRank}-${endRank}위**\n`;
+  } else {
+    text = `🏆 **서버 활동 랭킹 ${startRank}-${endRank}위**\n`;
+  }
 
   if (type === "activity") {
     text += "채팅 1회 + 음성 1분 = 1점\n";
@@ -494,6 +697,12 @@ async function buildRankingPage(guild, type, page) {
         ) || Boolean(rankedUser.member.voice?.channelId);
 
       text += `${getRankLabel(rank)} ${rankedUser.member.displayName} — ${formatDuration(rankedUser.voiceMs)}${isActive ? " · 접속 중" : ""}\n`;
+      return;
+    }
+
+    if (type === "bump") {
+      const lastBumped = formatDiscordRelativeTime(rankedUser.lastBumpedAt);
+      text += `${getRankLabel(rank)} ${rankedUser.member.displayName} — ${rankedUser.bumpCount}회${lastBumped ? ` · 최근 ${lastBumped}` : ""}\n`;
       return;
     }
 
@@ -545,6 +754,17 @@ const commands = [
   new SlashCommandBuilder()
     .setName("음성방랭킹")
     .setDescription("음성방 체류 시간 랭킹을 확인합니다"),
+
+  new SlashCommandBuilder()
+    .setName("범프랭킹")
+    .setDescription("DISBOARD bump 횟수 랭킹을 확인합니다"),
+
+  new SlashCommandBuilder()
+    .setName("범프초기화")
+    .setDescription("DISBOARD bump 기록을 초기화합니다 (관리자 전용)")
+    .setDefaultMemberPermissions(
+      PermissionsBitField.Flags.Administrator
+    ),
 
   new SlashCommandBuilder()
     .setName("상담신청")
@@ -635,6 +855,13 @@ client.on("ready", async () => {
 // 💬 메시지 감시 & 레벨링 (Firebase)
 // =======================
 client.on("messageCreate", async (message) => {
+  if (message.guild && DISBOARD_BOT_IDS.has(message.author.id)) {
+    await recordDisboardBump(message).catch((error) => {
+      console.error("🚨 DISBOARD bump 기록 오류:", error);
+    });
+    return;
+  }
+
   if (message.author.bot) return;
   if (!message.guild) return;
 
@@ -831,7 +1058,7 @@ client.on("interactionCreate", async (interaction) => {
 
     const [, type, pageText] = interaction.customId.split(":");
 
-    if (!["activity", "voice"].includes(type)) {
+    if (!RANKING_TYPES.has(type)) {
       return interaction.reply({
         content: "❌ 알 수 없는 랭킹 버튼입니다.",
         ephemeral: true,
@@ -1328,6 +1555,38 @@ if (commandName === "상담종료") {
   }
 
   // =======================
+  // 🚀 /범프랭킹
+  // =======================
+  if (commandName === "범프랭킹") {
+    await interaction.deferReply();
+    const payload = await buildRankingPage(guild, "bump", 0);
+    return interaction.editReply(payload);
+  }
+
+  // =======================
+  // 🧹 /범프초기화
+  // =======================
+  if (commandName === "범프초기화") {
+    if (
+      !member.permissions.has(
+        PermissionsBitField.Flags.Administrator
+      )
+    ) {
+      return interaction.reply({
+        content: "⛔ 관리자만 사용할 수 있습니다.",
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    const resetCount = await resetBumpStats(guild.id);
+
+    return interaction.editReply(
+      `🧹 DISBOARD bump 기록을 초기화했습니다. (${resetCount}명)`
+    );
+  }
+
+  // =======================
   // 🧹 /활동초기화
   // =======================
   if (commandName === "활동초기화") {
@@ -1381,11 +1640,13 @@ app.get("/api/stats/:guildId", async (req, res) => {
       const count = toNumber(rawData.count);
       const voiceMs = getEffectiveVoiceMs(rawData, guildId, doc.id, now);
       const activityScore = getActivityScore(count, voiceMs);
+      const bumpCount = toNumber(rawData.bumpCount);
 
       return {
         userId: doc.id,
         ...rawData,
         count,
+        bumpCount,
         voiceMs,
         voiceTime: formatDuration(voiceMs),
         activityScore,
