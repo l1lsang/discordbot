@@ -83,6 +83,12 @@ const DISBOARD_BOT_IDS = new Set(
     .map((id) => id.trim())
     .filter(Boolean)
 );
+const BUMP_CLAIM_WINDOW_MINUTES = Math.max(
+  1,
+  toNumber(process.env.BUMP_CLAIM_WINDOW_MINUTES, 10)
+);
+const BUMP_CLAIM_WINDOW_MS = BUMP_CLAIM_WINDOW_MINUTES * 60 * 1000;
+const BUMP_CLAIM_BUTTON_PREFIX = "bump-claim:";
 const activeVoiceSessions = new Map();
 
 function getVoiceSessionKey(guildId, userId) {
@@ -249,10 +255,51 @@ function isDisboardBumpDoneMessage(message) {
   );
 }
 
-function resolveDisboardBumperId(message) {
+function resolveInteractionMetadataUserId(metadata) {
+  let current = metadata;
+
+  while (current) {
+    if (current.user?.id) {
+      return current.user.id;
+    }
+
+    current = current.triggeringInteractionMetadata;
+  }
+
+  return null;
+}
+
+async function resolveReplyAuthorId(message) {
+  const repliedUser = message.mentions.repliedUser;
+
+  if (repliedUser && !repliedUser.bot && repliedUser.id !== message.author.id) {
+    return repliedUser.id;
+  }
+
+  if (!message.reference?.messageId) {
+    return null;
+  }
+
+  const referencedMessage = await message.fetchReference().catch((error) => {
+    console.warn("⚠️ DISBOARD bump 답장 원본 조회 실패:", error);
+    return null;
+  });
+
+  const author = referencedMessage?.author;
+  return author && !author.bot && author.id !== message.author.id
+    ? author.id
+    : null;
+}
+
+async function resolveDisboardBumperId(message) {
+  const replyAuthorId = await resolveReplyAuthorId(message);
+
+  if (replyAuthorId) {
+    return replyAuthorId;
+  }
+
   const interactionUserId =
-    message.interactionMetadata?.user?.id ||
-    message.interactionMetadata?.triggeringInteractionMetadata?.user?.id ||
+    resolveInteractionMetadataUserId(message.interactionMetadata) ||
     message.interaction?.user?.id;
 
   if (interactionUserId && interactionUserId !== message.author.id) {
@@ -271,46 +318,104 @@ function resolveDisboardBumperId(message) {
   return mentionMatch?.[1] || null;
 }
 
-async function recordDisboardBump(message) {
-  if (!isDisboardBumpDoneMessage(message)) {
-    return false;
+function bumpEventsRef(guildId) {
+  return db
+    .collection("guilds")
+    .doc(guildId)
+    .collection("bumpEvents");
+}
+
+function bumpEventRef(guildId, bumpMessageId) {
+  return bumpEventsRef(guildId).doc(bumpMessageId);
+}
+
+function createBumpEventPatch(message) {
+  const messageCreatedAtMs = message.createdTimestamp || Date.now();
+
+  return {
+    bumpMessageId: message.id,
+    channelId: message.channelId,
+    disboardBotId: message.author.id,
+    referenceMessageId: message.reference?.messageId || null,
+    referenceChannelId: message.reference?.channelId || null,
+    bumpMessageCreatedAt:
+      admin.firestore.Timestamp.fromMillis(messageCreatedAtMs),
+    claimExpiresAt:
+      admin.firestore.Timestamp.fromMillis(
+        messageCreatedAtMs + BUMP_CLAIM_WINDOW_MS
+      ),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+function isBumpEventExpired(data, now = Date.now()) {
+  const expiresAt = timestampToMillis(data?.claimExpiresAt);
+
+  if (expiresAt) {
+    return now > expiresAt;
   }
 
-  const bumperId = resolveDisboardBumperId(message);
+  const createdAt =
+    timestampToMillis(data?.bumpMessageCreatedAt) ||
+    timestampToMillis(data?.createdAt);
 
-  if (!bumperId) {
-    console.warn("⚠️ DISBOARD bump 유저를 찾지 못했습니다:", message.id);
-    return false;
-  }
+  return createdAt ? now - createdAt > BUMP_CLAIM_WINDOW_MS : false;
+}
 
-  const member =
-    message.guild.members.cache.get(bumperId) ||
-    await message.guild.members.fetch(bumperId).catch(() => null);
+function buildBumpClaimRow(bumpMessageId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${BUMP_CLAIM_BUTTON_PREFIX}${bumpMessageId}`)
+      .setLabel("내 bump로 기록")
+      .setEmoji("🚀")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
 
-  if (!member || member.user.bot) {
-    return false;
-  }
-
+async function recordBumpForMember(message, member, source) {
+  const eventRef = bumpEventRef(message.guild.id, message.id);
   const userRef = db
     .collection("guilds")
     .doc(message.guild.id)
     .collection("users")
     .doc(member.id);
 
-  let bumpCount = 0;
-  let alreadyRecorded = false;
+  let result = {
+    recorded: false,
+    alreadyRecorded: false,
+    bumpCount: 0,
+    bumperId: null,
+  };
 
   await db.runTransaction(async (transaction) => {
-    const snap = await transaction.get(userRef);
-    const prev = snap.exists ? snap.data() : {};
+    const eventSnap = await transaction.get(eventRef);
+    const eventData = eventSnap.exists ? eventSnap.data() : {};
 
-    if (prev.lastBumpMessageId === message.id) {
-      bumpCount = toNumber(prev.bumpCount);
-      alreadyRecorded = true;
+    if (eventData.status === "recorded") {
+      result = {
+        recorded: false,
+        alreadyRecorded: true,
+        bumpCount: 0,
+        bumperId: eventData.bumperId || null,
+      };
       return;
     }
 
-    bumpCount = toNumber(prev.bumpCount) + 1;
+    const userSnap = await transaction.get(userRef);
+    const prev = userSnap.exists ? userSnap.data() : {};
+    const bumpCount = toNumber(prev.bumpCount) + 1;
+    const eventPatch = {
+      ...createBumpEventPatch(message),
+      status: "recorded",
+      bumperId: member.id,
+      recordedBy: source,
+      recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (!eventSnap.exists) {
+      eventPatch.createdAt = admin.firestore.FieldValue.serverTimestamp();
+    }
 
     transaction.set(
       userRef,
@@ -324,11 +429,299 @@ async function recordDisboardBump(message) {
       },
       { merge: true }
     );
+
+    transaction.set(eventRef, eventPatch, { merge: true });
+
+    result = {
+      recorded: true,
+      alreadyRecorded: false,
+      bumpCount,
+      bumperId: member.id,
+    };
   });
 
-  if (!alreadyRecorded) {
+  return result;
+}
+
+async function registerPendingDisboardBump(message) {
+  const eventRef = bumpEventRef(message.guild.id, message.id);
+  let shouldSendPrompt = false;
+
+  await db.runTransaction(async (transaction) => {
+    const eventSnap = await transaction.get(eventRef);
+    const eventData = eventSnap.exists ? eventSnap.data() : {};
+
+    if (eventData.status === "recorded" || eventData.status === "pending") {
+      return;
+    }
+
+    const eventPatch = {
+      ...createBumpEventPatch(message),
+      status: "pending",
+      pendingReason: "missing_bumper",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    transaction.set(eventRef, eventPatch, { merge: true });
+    shouldSendPrompt = true;
+  });
+
+  if (!shouldSendPrompt) {
+    return false;
+  }
+
+  const prompt = await message
+    .reply({
+      content:
+        "🚀 DISBOARD bump 성공은 확인했는데 누가 bump했는지 자동으로 못 찾았어요.\n" +
+        `방금 bump한 분은 ${BUMP_CLAIM_WINDOW_MINUTES}분 안에 아래 버튼을 눌러 기록해 주세요.`,
+      components: [buildBumpClaimRow(message.id)],
+      allowedMentions: { repliedUser: false },
+    })
+    .catch((error) => {
+      console.warn("⚠️ DISBOARD bump 인증 버튼 전송 실패:", error);
+      return null;
+    });
+
+  if (prompt) {
+    await eventRef.set(
+      {
+        claimPromptMessageId: prompt.id,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
+  return true;
+}
+
+async function expireBumpEventRefs(refs) {
+  let batch = db.batch();
+  let writes = 0;
+
+  for (const ref of refs) {
+    batch.set(
+      ref,
+      {
+        status: "expired",
+        expiredAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    writes++;
+
+    if (writes === 500) {
+      await batch.commit();
+      batch = db.batch();
+      writes = 0;
+    }
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+}
+
+async function findLatestPendingBumpEvent(guildId, channelId) {
+  const snap = await bumpEventsRef(guildId)
+    .where("status", "==", "pending")
+    .get();
+
+  const now = Date.now();
+  const expiredRefs = [];
+  const candidates = [];
+
+  for (const doc of snap.docs) {
+    const data = doc.data();
+
+    if (isBumpEventExpired(data, now)) {
+      expiredRefs.push(doc.ref);
+      continue;
+    }
+
+    if (data.channelId === channelId) {
+      candidates.push({ id: doc.id, data });
+    }
+  }
+
+  await expireBumpEventRefs(expiredRefs).catch((error) => {
+    console.error("⚠️ 만료된 bump 인증 정리 실패:", error);
+  });
+
+  candidates.sort((a, b) => {
+    return (
+      toNumber(timestampToMillis(b.data.bumpMessageCreatedAt)) -
+      toNumber(timestampToMillis(a.data.bumpMessageCreatedAt))
+    );
+  });
+
+  return candidates[0] || null;
+}
+
+async function claimPendingDisboardBump(guild, userId, bumpMessageId) {
+  const member =
+    guild.members.cache.get(userId) ||
+    await guild.members.fetch(userId).catch(() => null);
+
+  if (!member || member.user.bot) {
+    return { status: "invalid-member" };
+  }
+
+  const eventRef = bumpEventRef(guild.id, bumpMessageId);
+  const userRef = db
+    .collection("guilds")
+    .doc(guild.id)
+    .collection("users")
+    .doc(member.id);
+
+  let result = { status: "missing" };
+
+  await db.runTransaction(async (transaction) => {
+    const eventSnap = await transaction.get(eventRef);
+
+    if (!eventSnap.exists) {
+      result = { status: "missing" };
+      return;
+    }
+
+    const eventData = eventSnap.data();
+
+    if (eventData.status === "recorded") {
+      result = {
+        status: "already-recorded",
+        bumperId: eventData.bumperId || null,
+      };
+      return;
+    }
+
+    if (eventData.status !== "pending") {
+      result = { status: "unavailable" };
+      return;
+    }
+
+    if (isBumpEventExpired(eventData)) {
+      transaction.set(
+        eventRef,
+        {
+          status: "expired",
+          expiredAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      result = { status: "expired" };
+      return;
+    }
+
+    const userSnap = await transaction.get(userRef);
+    const userData = userSnap.exists ? userSnap.data() : {};
+    const bumpCount = toNumber(userData.bumpCount) + 1;
+
+    transaction.set(
+      userRef,
+      {
+        bumpCount,
+        lastBumpedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastBumpMessageId: bumpMessageId,
+        lastBumpChannelId: eventData.channelId || null,
+        bumpUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    transaction.set(
+      eventRef,
+      {
+        status: "recorded",
+        bumperId: member.id,
+        recordedBy: "claim",
+        recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+        claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    result = {
+      status: "recorded",
+      bumpCount,
+      bumperId: member.id,
+    };
+  });
+
+  if (result.status === "recorded") {
     console.log(
-      `🚀 DISBOARD bump 기록: ${message.guild.name} / ${member.user.tag} (${bumpCount}회)`
+      `🚀 DISBOARD bump 인증 기록: ${guild.name} / ${member.user.tag} (${result.bumpCount}회)`
+    );
+  }
+
+  return result;
+}
+
+function formatBumpClaimResult(result, user) {
+  if (result.status === "recorded") {
+    return `✅ ${user}님의 DISBOARD bump를 기록했어요. 현재 ${result.bumpCount}회입니다.`;
+  }
+
+  if (result.status === "already-recorded") {
+    if (result.bumperId === user.id) {
+      return "ℹ️ 이미 내 bump로 기록된 성공 메시지예요.";
+    }
+
+    return result.bumperId
+      ? `ℹ️ 이미 <@${result.bumperId}> 님의 bump로 기록된 성공 메시지예요.`
+      : "ℹ️ 이미 기록된 DISBOARD bump 성공 메시지예요.";
+  }
+
+  if (result.status === "expired") {
+    return `⏰ bump 인증 가능 시간이 지났어요. 성공 메시지 생성 후 ${BUMP_CLAIM_WINDOW_MINUTES}분 안에 인증해 주세요.`;
+  }
+
+  if (result.status === "invalid-member") {
+    return "❌ 서버 멤버만 DISBOARD bump를 인증할 수 있어요.";
+  }
+
+  return "❌ 인증할 수 있는 DISBOARD bump 성공 메시지를 찾지 못했어요.";
+}
+
+async function recordDisboardBump(message) {
+  if (!isDisboardBumpDoneMessage(message)) {
+    return false;
+  }
+
+  const bumperId = await resolveDisboardBumperId(message);
+
+  if (!bumperId) {
+    console.warn("⚠️ DISBOARD bump 유저를 찾지 못했습니다:", message.id);
+    await registerPendingDisboardBump(message);
+    return true;
+  }
+
+  const member =
+    message.guild.members.cache.get(bumperId) ||
+    await message.guild.members.fetch(bumperId).catch(() => null);
+
+  if (!member) {
+    console.warn("⚠️ DISBOARD bump 멤버를 조회하지 못했습니다:", bumperId);
+    await registerPendingDisboardBump(message);
+    return true;
+  }
+
+  if (member.user.bot) {
+    return false;
+  }
+
+  const result = await recordBumpForMember(message, member, "auto");
+
+  if (result.recorded) {
+    console.log(
+      `🚀 DISBOARD bump 기록: ${message.guild.name} / ${member.user.tag} (${result.bumpCount}회)`
     );
   }
 
@@ -371,6 +764,25 @@ async function resetBumpStats(guildId) {
 
     writes++;
     resetCount++;
+
+    if (writes === 500) {
+      await batch.commit();
+      batch = db.batch();
+      writes = 0;
+    }
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+
+  const eventsSnap = await bumpEventsRef(guildId).get();
+  batch = db.batch();
+  writes = 0;
+
+  for (const doc of eventsSnap.docs) {
+    batch.delete(doc.ref);
+    writes++;
 
     if (writes === 500) {
       await batch.commit();
@@ -760,6 +1172,10 @@ const commands = [
     .setDescription("DISBOARD bump 횟수 랭킹을 확인합니다"),
 
   new SlashCommandBuilder()
+    .setName("범프인증")
+    .setDescription("자동 인식이 안 된 DISBOARD bump를 내 기록으로 인증합니다"),
+
+  new SlashCommandBuilder()
     .setName("범프초기화")
     .setDescription("DISBOARD bump 기록을 초기화합니다 (관리자 전용)")
     .setDefaultMemberPermissions(
@@ -854,6 +1270,20 @@ client.on("ready", async () => {
 // =======================
 // 💬 메시지 감시 & 레벨링 (Firebase)
 // =======================
+client.on("messageUpdate", async (oldMessage, newMessage) => {
+  const message = newMessage.partial
+    ? await newMessage.fetch().catch(() => null)
+    : newMessage;
+
+  if (!message?.guild || !DISBOARD_BOT_IDS.has(message.author?.id)) {
+    return;
+  }
+
+  await recordDisboardBump(message).catch((error) => {
+    console.error("🚨 DISBOARD bump 수정 메시지 기록 오류:", error);
+  });
+});
+
 client.on("messageCreate", async (message) => {
   if (message.guild && DISBOARD_BOT_IDS.has(message.author.id)) {
     await recordDisboardBump(message).catch((error) => {
@@ -1043,6 +1473,48 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.followUp({
       content: `# ${selectedType} 형식의 상담입니다`,
     });
+  }
+
+  if (
+    interaction.isButton() &&
+    interaction.customId.startsWith(BUMP_CLAIM_BUTTON_PREFIX)
+  ) {
+    if (!interaction.guild) {
+      return interaction.reply({
+        content: "❌ 서버 안에서만 사용할 수 있는 버튼입니다.",
+        ephemeral: true,
+      });
+    }
+
+    const bumpMessageId = interaction.customId.slice(
+      BUMP_CLAIM_BUTTON_PREFIX.length
+    );
+
+    if (!/^\d{17,20}$/.test(bumpMessageId)) {
+      return interaction.reply({
+        content: "❌ 알 수 없는 bump 인증 버튼입니다.",
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const result = await claimPendingDisboardBump(
+        interaction.guild,
+        interaction.user.id,
+        bumpMessageId
+      );
+
+      return interaction.editReply(
+        formatBumpClaimResult(result, interaction.user)
+      );
+    } catch (error) {
+      console.error("🚨 DISBOARD bump 인증 버튼 처리 오류:", error);
+      return interaction.editReply(
+        "❌ bump 인증 처리 중 오류가 발생했습니다."
+      );
+    }
   }
 
   if (
@@ -1561,6 +2033,41 @@ if (commandName === "상담종료") {
     await interaction.deferReply();
     const payload = await buildRankingPage(guild, "bump", 0);
     return interaction.editReply(payload);
+  }
+
+  // =======================
+  // 🚀 /범프인증
+  // =======================
+  if (commandName === "범프인증") {
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const pendingEvent = await findLatestPendingBumpEvent(
+        guild.id,
+        interaction.channelId
+      );
+
+      if (!pendingEvent) {
+        return interaction.editReply(
+          `❌ 이 채널에서 인증 대기 중인 DISBOARD bump를 찾지 못했어요. 성공 메시지 후 ${BUMP_CLAIM_WINDOW_MINUTES}분 안에 사용해 주세요.`
+        );
+      }
+
+      const result = await claimPendingDisboardBump(
+        guild,
+        interaction.user.id,
+        pendingEvent.id
+      );
+
+      return interaction.editReply(
+        formatBumpClaimResult(result, interaction.user)
+      );
+    } catch (error) {
+      console.error("🚨 DISBOARD bump 인증 명령어 처리 오류:", error);
+      return interaction.editReply(
+        "❌ bump 인증 처리 중 오류가 발생했습니다."
+      );
+    }
   }
 
   // =======================
