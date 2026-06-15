@@ -1927,11 +1927,6 @@ if (commandName === "상담신청") {
 
     console.log("✅ 상담 음성방 생성:", voiceChannel.id);
 
-    // 관리자 멘션 문자열
-    const adminMentions = adminRoles
-      .map(role => `<@&${role.id}>`)
-      .join(" ");
-
     await channel.send({
       content:
 `📩 **새 상담이 시작되었습니다**
@@ -1940,10 +1935,9 @@ if (commandName === "상담신청") {
 🧑‍💼 담당 상담사: <@${counselorMember.id}>
 🎙️ 전용 음성방: ${voiceChannel}
 
-${adminMentions ? `${adminMentions} ` : ""}상담 요청이 들어왔습니다 🙏`,
+상담 요청이 들어왔습니다 🙏`,
       allowedMentions: {
         users: [member.id, counselorMember.id],
-        roles: adminRoles.map(role => role.id),
         parse: [],
       },
     });
