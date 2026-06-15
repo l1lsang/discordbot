@@ -2,6 +2,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
   Client,
   EmbedBuilder,
   GatewayIntentBits,
@@ -172,6 +173,13 @@ function formatLeaveLogMessage(template, member) {
 function toNumber(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function parseIdList(value) {
+  return (value || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
 }
 
 function timestampToMillis(value) {
@@ -1184,11 +1192,17 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("상담신청")
-    .setDescription("관리자에게 상담을 요청합니다"),
+    .setDescription("상담사를 선택해 상담을 요청합니다")
+    .addUserOption((option) =>
+      option
+        .setName("상담사")
+        .setDescription("상담을 담당할 상담사")
+        .setRequired(true)
+    ),
 
   new SlashCommandBuilder()
     .setName("상담종료")
-    .setDescription("현재 상담을 종료합니다 (관리자)"),
+    .setDescription("현재 상담과 연결된 음성방을 종료합니다 (관리자/상담사)"),
 
   new SlashCommandBuilder()
     .setName("퇴장로그")
@@ -1687,47 +1701,85 @@ client.on("interactionCreate", async (interaction) => {
 // =======================
 if (commandName === "상담신청") {
 
+  let channel = null;
+  let voiceChannel = null;
+
   try {
 
     const guild = interaction.guild;
 
+    await interaction.deferReply({ ephemeral: true });
+
     if (!guild || !member) {
       console.log("❌ guild 또는 member 없음");
-      return;
+      return interaction.editReply("❌ 서버 멤버 정보를 불러오지 못했습니다.");
     }
 
-    const CONSULT_CATEGORY_IDS =
+    const CONSULT_CATEGORY_IDS = parseIdList(
       process.env.CONSULT_CATEGORY_IDS
-        ?.split(",")
-        .map(id => id.trim()) || [];
+    );
 
-    const ADMIN_ROLE_IDS =
-      process.env.ADMIN_ROLE_IDS
-        ?.split(",")
-        .map(id => id.trim()) || [];
+    const CONSULT_VOICE_CATEGORY_ID =
+      process.env.CONSULT_VOICE_CATEGORY_ID?.trim();
+
+    const ADMIN_ROLE_IDS = parseIdList(process.env.ADMIN_ROLE_IDS);
+
+    const counselorUser = interaction.options.getUser("상담사");
+
+    if (!counselorUser) {
+      return interaction.editReply(
+        "❌ 담당 상담사를 선택해주세요. 명령어가 갱신되지 않았다면 봇을 다시 시작한 뒤 Discord 명령어를 다시 불러와주세요."
+      );
+    }
+
+    if (counselorUser.bot) {
+      return interaction.editReply("❌ 봇은 상담사로 선택할 수 없습니다.");
+    }
+
+    if (counselorUser.id === member.id) {
+      return interaction.editReply("❌ 자기 자신을 상담사로 선택할 수 없습니다.");
+    }
+
+    const counselorMember = await guild.members
+      .fetch(counselorUser.id)
+      .catch(() => null);
+
+    if (!counselorMember) {
+      return interaction.editReply("❌ 선택한 상담사를 서버에서 찾을 수 없습니다.");
+    }
 
     console.log("📂 카테고리 목록:", CONSULT_CATEGORY_IDS);
+    console.log("🎙️ 음성 카테고리:", CONSULT_VOICE_CATEGORY_ID || "텍스트 상담 카테고리 사용");
     console.log("🛠 관리자 역할:", ADMIN_ROLE_IDS);
+    console.log("🧑‍💼 선택된 상담사:", counselorMember.user.tag);
 
-    if (CONSULT_CATEGORY_IDS.length === 0) {
+    const fallbackCategoryIds = CONSULT_VOICE_CATEGORY_ID
+      ? [CONSULT_VOICE_CATEGORY_ID]
+      : [];
+
+    const categoryIds =
+      CONSULT_CATEGORY_IDS.length > 0
+        ? CONSULT_CATEGORY_IDS
+        : fallbackCategoryIds;
+
+    if (categoryIds.length === 0) {
       console.log("❌ 카테고리 환경변수 없음");
-      return interaction.reply({
-        content: "❌ 상담 카테고리가 설정되지 않았습니다.",
-        ephemeral: true,
-      });
+      return interaction.editReply(
+        "❌ 상담 카테고리가 설정되지 않았습니다. `CONSULT_CATEGORY_IDS` 또는 `CONSULT_VOICE_CATEGORY_ID`를 설정해주세요."
+      );
     }
 
     // 카테고리 랜덤 선택
     const categoryId =
-      CONSULT_CATEGORY_IDS[
-        Math.floor(Math.random() * CONSULT_CATEGORY_IDS.length)
+      categoryIds[
+        Math.floor(Math.random() * categoryIds.length)
       ];
 
     console.log("🎯 선택된 카테고리:", categoryId);
 
-    const category = guild.channels.cache.get(categoryId);
+    const category = await guild.channels.fetch(categoryId).catch(() => null);
 
-    if (!category) {
+    if (!category || category.type !== ChannelType.GuildCategory) {
       console.log("❌ 카테고리를 찾을 수 없음:", categoryId);
 
       console.log(
@@ -1739,32 +1791,49 @@ if (commandName === "상담신청") {
         }))
       );
 
-      return interaction.reply({
-        content: "❌ 상담 카테고리를 찾을 수 없습니다.",
-        ephemeral: true,
-      });
+      return interaction.editReply("❌ 상담 카테고리를 찾을 수 없습니다.");
     }
 
     console.log("✅ 카테고리 확인:", category.name);
 
-    // 관리자 권한 배열 생성
-    const adminPermissions = ADMIN_ROLE_IDS
+    const voiceCategoryId = CONSULT_VOICE_CATEGORY_ID || category.id;
+    const voiceCategory =
+      voiceCategoryId === category.id
+        ? category
+        : await guild.channels.fetch(voiceCategoryId).catch(() => null);
+
+    if (!voiceCategory || voiceCategory.type !== ChannelType.GuildCategory) {
+      console.log("❌ 음성 카테고리를 찾을 수 없음:", voiceCategoryId);
+      return interaction.editReply(
+        "❌ 상담 음성방 카테고리를 찾을 수 없습니다. `CONSULT_VOICE_CATEGORY_ID`를 확인해주세요."
+      );
+    }
+
+    const botMember =
+      guild.members.me || await guild.members.fetchMe();
+
+    const adminRoles = ADMIN_ROLE_IDS
       .map(id => guild.roles.cache.get(id))
-      .filter(role => role)
+      .filter(role => role);
+
+    // 관리자 권한 배열 생성
+    const adminPermissions = adminRoles
       .map(role => ({
         id: role.id,
         allow: [
           PermissionsBitField.Flags.ViewChannel,
           PermissionsBitField.Flags.SendMessages,
+          PermissionsBitField.Flags.ReadMessageHistory,
         ],
       }));
 
     console.log("🔐 관리자 권한 설정:", adminPermissions);
 
-    const channel = await guild.channels.create({
+    channel = await guild.channels.create({
       name: `상담-${member.user.username}`,
-      type: 0,
+      type: ChannelType.GuildText,
       parent: category.id,
+      topic: `상담 신청자:${member.id} 상담사:${counselorMember.id}`,
 
       permissionOverwrites: [
         {
@@ -1772,10 +1841,28 @@ if (commandName === "상담신청") {
           deny: [PermissionsBitField.Flags.ViewChannel],
         },
         {
+          id: botMember.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.ReadMessageHistory,
+            PermissionsBitField.Flags.ManageChannels,
+          ],
+        },
+        {
           id: member.id,
           allow: [
             PermissionsBitField.Flags.ViewChannel,
             PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.ReadMessageHistory,
+          ],
+        },
+        {
+          id: counselorMember.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.ReadMessageHistory,
           ],
         },
         ...adminPermissions,
@@ -1784,18 +1871,82 @@ if (commandName === "상담신청") {
 
     console.log("✅ 상담 채널 생성:", channel.id);
 
+    voiceChannel = await guild.channels.create({
+      name: `상담음성-${member.user.username}`,
+      type: ChannelType.GuildVoice,
+      parent: voiceCategory.id,
+      userLimit: 2,
+
+      permissionOverwrites: [
+        {
+          id: guild.id,
+          deny: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.Connect,
+          ],
+        },
+        {
+          id: botMember.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.Connect,
+            PermissionsBitField.Flags.ManageChannels,
+            PermissionsBitField.Flags.MoveMembers,
+          ],
+        },
+        {
+          id: member.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.Connect,
+            PermissionsBitField.Flags.Speak,
+            PermissionsBitField.Flags.Stream,
+            PermissionsBitField.Flags.UseVAD,
+          ],
+        },
+        {
+          id: counselorMember.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.Connect,
+            PermissionsBitField.Flags.Speak,
+            PermissionsBitField.Flags.Stream,
+            PermissionsBitField.Flags.UseVAD,
+          ],
+        },
+      ],
+    });
+
+    await channel
+      .setTopic(
+        `상담 신청자:${member.id} 상담사:${counselorMember.id} 음성방:${voiceChannel.id}`
+      )
+      .catch((error) => {
+        console.warn("⚠️ 상담 채널 topic 업데이트 실패:", error);
+      });
+
+    console.log("✅ 상담 음성방 생성:", voiceChannel.id);
+
     // 관리자 멘션 문자열
-    const adminMentions = ADMIN_ROLE_IDS
-      .map(id => `<@&${id}>`)
+    const adminMentions = adminRoles
+      .map(role => `<@&${role.id}>`)
       .join(" ");
 
-    await channel.send(
+    await channel.send({
+      content:
 `📩 **새 상담이 시작되었습니다**
 
 👤 신청자: <@${member.id}>
+🧑‍💼 담당 상담사: <@${counselorMember.id}>
+🎙️ 전용 음성방: ${voiceChannel}
 
-${adminMentions} 상담 요청이 들어왔습니다 🙏`
-    );
+${adminMentions ? `${adminMentions} ` : ""}상담 요청이 들어왔습니다 🙏`,
+      allowedMentions: {
+        users: [member.id, counselorMember.id],
+        roles: adminRoles.map(role => role.id),
+        parse: [],
+      },
+    });
 
     const consultTypeMenu = new StringSelectMenuBuilder()
       .setCustomId(`consult-type:${member.id}`)
@@ -1818,14 +1969,27 @@ ${adminMentions} 상담 요청이 들어왔습니다 🙏`
 
     console.log("📨 상담 시작 메시지 전송");
 
-    return interaction.reply({
-      content: `✅ 상담 채널이 생성되었습니다 → ${channel}`,
-      ephemeral: true,
-    });
+    return interaction.editReply(
+      `✅ 상담 채널과 2인 전용 음성방이 생성되었습니다.\n텍스트: ${channel}\n음성방: ${voiceChannel}\n상담사: <@${counselorMember.id}>`
+    );
 
   } catch (error) {
 
     console.error("🚨 상담 채널 생성 오류:", error);
+
+    if (voiceChannel) {
+      await voiceChannel.delete("상담 신청 생성 실패 정리").catch(() => null);
+    }
+
+    if (channel) {
+      await channel.delete("상담 신청 생성 실패 정리").catch(() => null);
+    }
+
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply(
+        "❌ 상담 채널 생성 중 오류가 발생했습니다."
+      );
+    }
 
     return interaction.reply({
       content: "❌ 상담 채널 생성 중 오류가 발생했습니다.",
@@ -1838,35 +2002,50 @@ ${adminMentions} 상담 요청이 들어왔습니다 🙏`
 // =======================
 if (commandName === "상담종료") {
 
-  const ADMIN_ROLE_IDS =
-    process.env.ADMIN_ROLE_IDS?.split(",").map(id => id.trim()).filter(Boolean) || [];
+  const ADMIN_ROLE_IDS = parseIdList(process.env.ADMIN_ROLE_IDS);
 
   const memberRoles = member.roles.cache;
+  const channel = interaction.channel;
+  const assignedCounselorId =
+    channel?.topic?.match(/상담사:(\d{17,20})/)?.[1] || null;
 
   const isAdmin =
     member.permissions.has(PermissionsBitField.Flags.Administrator) ||
-    ADMIN_ROLE_IDS.some(roleId => memberRoles.has(roleId));
+    ADMIN_ROLE_IDS.some(roleId => memberRoles.has(roleId)) ||
+    assignedCounselorId === member.id;
 
   if (!isAdmin) {
     return interaction.reply({
-      content: "⛔ 관리자만 상담을 종료할 수 있습니다.",
+      content: "⛔ 관리자 또는 담당 상담사만 상담을 종료할 수 있습니다.",
       ephemeral: true,
     });
   }
 
-  const channel = interaction.channel;
-
-  if (!channel.name.startsWith("상담-")) {
+  if (!channel?.name?.startsWith("상담-")) {
     return interaction.reply({
       content: "❌ 상담 채널에서만 사용할 수 있습니다.",
       ephemeral: true,
     });
   }
 
-  await interaction.reply("🧹 상담을 종료합니다. 채널을 삭제합니다.");
+  const linkedVoiceChannelId =
+    channel.topic?.match(/음성방:(\d{17,20})/)?.[1] || null;
+  const linkedVoiceChannel = linkedVoiceChannelId
+    ? await guild.channels.fetch(linkedVoiceChannelId).catch(() => null)
+    : null;
 
-  setTimeout(() => {
-    channel.delete();
+  await interaction.reply("🧹 상담을 종료합니다. 채널과 음성방을 삭제합니다.");
+
+  setTimeout(async () => {
+    if (linkedVoiceChannel) {
+      await linkedVoiceChannel
+        .delete("상담 종료")
+        .catch((error) => console.error("🚨 상담 음성방 삭제 오류:", error));
+    }
+
+    await channel
+      .delete("상담 종료")
+      .catch((error) => console.error("🚨 상담 채널 삭제 오류:", error));
   }, 3000);
 }
   // =======================
