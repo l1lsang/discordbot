@@ -67,6 +67,33 @@ const CONSULT_TYPE_OPTIONS = [
   "기타",
 ];
 
+const MBTI_DIMENSIONS = [
+  ["I", "E"],
+  ["N", "S"],
+  ["T", "F"],
+  ["J", "P"],
+];
+const EMPTY_MBTI_STATE = "____";
+const MBTI_BUTTON_PREFIX = "mbti";
+const MBTI_TYPES = new Set([
+  "INTJ",
+  "INTP",
+  "INFJ",
+  "INFP",
+  "ISTJ",
+  "ISTP",
+  "ISFJ",
+  "ISFP",
+  "ENTJ",
+  "ENTP",
+  "ENFJ",
+  "ENFP",
+  "ESTJ",
+  "ESTP",
+  "ESFJ",
+  "ESFP",
+]);
+
 const DEFAULT_LEAVE_LOG_MESSAGE = "{user} 님이 서버를 떠났습니다.";
 const USER_MENTION_TOKEN_PATTERN =
   /\{(?:user|mention|tag|username|displayName)\}/;
@@ -1137,6 +1164,302 @@ async function buildRankingPage(guild, type, page) {
   };
 }
 
+function normalizeMbtiState(value = EMPTY_MBTI_STATE) {
+  const raw = String(value || "");
+
+  return MBTI_DIMENSIONS
+    .map((letters, index) => (
+      letters.includes(raw[index]) ? raw[index] : "_"
+    ))
+    .join("");
+}
+
+function toggleMbtiState(state, dimensionIndex) {
+  const normalized = normalizeMbtiState(state).split("");
+  const letters = MBTI_DIMENSIONS[dimensionIndex];
+
+  if (!letters) {
+    return normalized.join("");
+  }
+
+  normalized[dimensionIndex] =
+    normalized[dimensionIndex] === letters[0] ? letters[1] : letters[0];
+
+  return normalized.join("");
+}
+
+function isCompleteMbtiState(state) {
+  return MBTI_TYPES.has(normalizeMbtiState(state));
+}
+
+function formatMbtiState(state) {
+  return normalizeMbtiState(state)
+    .split("")
+    .map((letter) => (letter === "_" ? "?" : letter))
+    .join("");
+}
+
+function buildMbtiPublicComponents() {
+  const row = new ActionRowBuilder();
+
+  MBTI_DIMENSIONS.forEach(([first, second], index) => {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${MBTI_BUTTON_PREFIX}:open:${index}`)
+        .setLabel(`${first} ↔ ${second}`)
+        .setStyle(ButtonStyle.Secondary)
+    );
+  });
+
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${MBTI_BUTTON_PREFIX}:open:confirm`)
+      .setLabel("확인")
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return [row];
+}
+
+function buildMbtiPrivateComponents(state) {
+  const normalized = normalizeMbtiState(state);
+  const row = new ActionRowBuilder();
+
+  MBTI_DIMENSIONS.forEach(([first, second], index) => {
+    const selected = normalized[index];
+
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${MBTI_BUTTON_PREFIX}:toggle:${index}:${normalized}`)
+        .setLabel(selected === "_" ? `${first} ↔ ${second}` : `${selected} 선택`)
+        .setStyle(selected === "_" ? ButtonStyle.Secondary : ButtonStyle.Primary)
+    );
+  });
+
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${MBTI_BUTTON_PREFIX}:confirm:${normalized}`)
+      .setLabel("확인")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!isCompleteMbtiState(normalized))
+  );
+
+  return [row];
+}
+
+function buildMbtiPromptPayload() {
+  return {
+    content: "MBTI를 선택해주세요",
+    components: buildMbtiPublicComponents(),
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildMbtiPickerPayload(state, notice = null) {
+  const normalized = normalizeMbtiState(state);
+  const lines = [
+    notice,
+    `선택된 MBTI: **${formatMbtiState(normalized)}**`,
+    "각 버튼을 눌러 I/E, N/S, T/F, J/P를 전환한 뒤 확인을 눌러주세요.",
+  ].filter(Boolean);
+
+  return {
+    content: lines.join("\n"),
+    components: buildMbtiPrivateComponents(normalized),
+    allowedMentions: { parse: [] },
+  };
+}
+
+function findMbtiRole(guild, mbti) {
+  return guild.roles.cache.find(
+    (role) => !role.managed && role.name.toUpperCase() === mbti
+  );
+}
+
+function canBotManageRole(botMember, role) {
+  return (
+    !role.managed &&
+    role.position < botMember.roles.highest.position
+  );
+}
+
+async function getOrCreateMbtiRole(guild, mbti, botMember) {
+  const normalized = normalizeMbtiState(mbti);
+
+  if (!isCompleteMbtiState(normalized)) {
+    return null;
+  }
+
+  const existingRole = findMbtiRole(guild, normalized);
+
+  if (existingRole) {
+    return existingRole;
+  }
+
+  if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    return null;
+  }
+
+  return guild.roles.create({
+    name: normalized,
+    reason: "MBTI 선택 역할 자동 생성",
+  });
+}
+
+async function assignMbtiRole(member, mbti) {
+  const guild = member.guild;
+  const normalized = normalizeMbtiState(mbti);
+  const botMember = guild.members.me || await guild.members.fetchMe();
+
+  if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    return { status: "missing-permission" };
+  }
+
+  const targetRole = await getOrCreateMbtiRole(guild, normalized, botMember);
+
+  if (!targetRole) {
+    return { status: "invalid-mbti" };
+  }
+
+  const currentMbtiRoles = member.roles.cache.filter((role) =>
+    MBTI_TYPES.has(role.name.toUpperCase())
+  );
+  const rolesToCheck = new Map(
+    currentMbtiRoles.map((role) => [role.id, role])
+  );
+  rolesToCheck.set(targetRole.id, targetRole);
+
+  const blockedRoles = [...rolesToCheck.values()].filter(
+    (role) => !canBotManageRole(botMember, role)
+  );
+
+  if (blockedRoles.length > 0) {
+    return {
+      status: "role-too-high",
+      roles: blockedRoles.map((role) => role.name),
+    };
+  }
+
+  const rolesToRemove = currentMbtiRoles
+    .filter((role) => role.id !== targetRole.id)
+    .map((role) => role.id);
+
+  if (rolesToRemove.length > 0) {
+    await member.roles.remove(rolesToRemove, "MBTI 역할 변경");
+  }
+
+  if (!member.roles.cache.has(targetRole.id)) {
+    await member.roles.add(targetRole, "MBTI 역할 선택");
+  }
+
+  return {
+    status: "assigned",
+    role: targetRole,
+    mbti: normalized,
+  };
+}
+
+async function handleMbtiButtonInteraction(interaction) {
+  if (!interaction.guild) {
+    return interaction.reply({
+      content: "❌ 서버 안에서만 사용할 수 있는 버튼입니다.",
+      ephemeral: true,
+    });
+  }
+
+  const [, action, detail, stateText] = interaction.customId.split(":");
+
+  if (action === "open") {
+    const dimensionIndex = Number.parseInt(detail, 10);
+    const state = Number.isInteger(dimensionIndex)
+      ? toggleMbtiState(EMPTY_MBTI_STATE, dimensionIndex)
+      : EMPTY_MBTI_STATE;
+    const notice = detail === "confirm"
+      ? "먼저 4개 지표를 모두 선택해주세요."
+      : null;
+
+    return interaction.reply({
+      ...buildMbtiPickerPayload(state, notice),
+      ephemeral: true,
+    });
+  }
+
+  if (action === "toggle") {
+    const dimensionIndex = Number.parseInt(detail, 10);
+    const state = toggleMbtiState(stateText, dimensionIndex);
+
+    return interaction.update(buildMbtiPickerPayload(state));
+  }
+
+  if (action !== "confirm") {
+    return interaction.reply({
+      content: "❌ 알 수 없는 MBTI 버튼입니다.",
+      ephemeral: true,
+    });
+  }
+
+  const state = normalizeMbtiState(detail);
+
+  if (!isCompleteMbtiState(state)) {
+    return interaction.update(
+      buildMbtiPickerPayload(state, "4개 지표를 모두 선택해주세요.")
+    );
+  }
+
+  await interaction.deferUpdate();
+
+  try {
+    const liveMember = await interaction.guild.members
+      .fetch(interaction.user.id)
+      .catch(() => null);
+
+    if (!liveMember) {
+      return interaction.editReply({
+        content: "❌ 멤버 정보를 불러오지 못했습니다.",
+        components: [],
+      });
+    }
+
+    const result = await assignMbtiRole(liveMember, state);
+
+    if (result.status === "missing-permission") {
+      return interaction.editReply({
+        content: "❌ 봇에 `역할 관리하기` 권한이 필요합니다.",
+        components: [],
+      });
+    }
+
+    if (result.status === "role-too-high") {
+      return interaction.editReply({
+        content:
+          "❌ 봇 역할보다 높은 MBTI 역할은 부여하거나 제거할 수 없습니다.\n" +
+          `확인할 역할: ${result.roles.map((name) => `\`${name}\``).join(", ")}`,
+        components: [],
+      });
+    }
+
+    if (result.status !== "assigned") {
+      return interaction.editReply({
+        content: "❌ MBTI 역할을 설정할 수 없습니다.",
+        components: [],
+      });
+    }
+
+    return interaction.editReply({
+      content: `✅ MBTI가 **${result.mbti}**로 설정되었습니다. ${result.role} 역할을 받았어요.`,
+      components: [],
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    console.error("🚨 MBTI 역할 설정 오류:", error);
+
+    return interaction.editReply({
+      content: "❌ MBTI 역할 설정 중 오류가 발생했습니다.",
+      components: [],
+    });
+  }
+}
+
 // =======================
 // 🔢 레벨 계산 함수 (Lv.1 ~ Lv.20)
 // =======================
@@ -1203,6 +1526,23 @@ const commands = [
   new SlashCommandBuilder()
     .setName("상담종료")
     .setDescription("현재 상담과 연결된 음성방을 종료합니다 (관리자/상담사)"),
+
+  new SlashCommandBuilder()
+    .setName("mbti설정")
+    .setDescription("지정한 채널에 MBTI 선택 버튼을 보냅니다 (관리자 전용)")
+    .addChannelOption((option) =>
+      option
+        .setName("채널")
+        .setDescription("MBTI 선택 메시지를 보낼 채널")
+        .addChannelTypes(
+          ChannelType.GuildText,
+          ChannelType.GuildAnnouncement
+        )
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(
+      PermissionsBitField.Flags.Administrator
+    ),
 
   new SlashCommandBuilder()
     .setName("퇴장로그")
@@ -1491,6 +1831,13 @@ client.on("interactionCreate", async (interaction) => {
 
   if (
     interaction.isButton() &&
+    interaction.customId.startsWith(`${MBTI_BUTTON_PREFIX}:`)
+  ) {
+    return handleMbtiButtonInteraction(interaction);
+  }
+
+  if (
+    interaction.isButton() &&
     interaction.customId.startsWith(BUMP_CLAIM_BUTTON_PREFIX)
   ) {
     if (!interaction.guild) {
@@ -1627,6 +1974,75 @@ client.on("interactionCreate", async (interaction) => {
 
   const { commandName, guild } = interaction;
   const member = liveMember;
+
+  // =======================
+  // 🧬 /mbti설정
+  // =======================
+  if (commandName === "mbti설정") {
+    if (
+      !member.permissions.has(
+        PermissionsBitField.Flags.Administrator
+      )
+    ) {
+      return interaction.reply({
+        content: "⛔ 관리자만 MBTI 선택 메시지를 설정할 수 있습니다.",
+        ephemeral: true,
+      });
+    }
+
+    const channel = interaction.options.getChannel("채널", true);
+
+    if (!channel.isTextBased()) {
+      return interaction.reply({
+        content: "❌ 텍스트 채널만 MBTI 선택 채널로 지정할 수 있습니다.",
+        ephemeral: true,
+      });
+    }
+
+    const botMember =
+      guild.members.me || await guild.members.fetchMe();
+    const botPermissions = channel.permissionsFor(botMember);
+
+    if (
+      !botPermissions?.has(PermissionsBitField.Flags.ViewChannel) ||
+      !botPermissions.has(PermissionsBitField.Flags.SendMessages)
+    ) {
+      return interaction.reply({
+        content:
+          "❌ 봇이 해당 채널에 메시지를 보낼 수 없습니다. `채널 보기`, `메시지 보내기` 권한을 확인해주세요.",
+        ephemeral: true,
+      });
+    }
+
+    if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+      return interaction.reply({
+        content: "❌ 봇에 `역할 관리하기` 권한이 필요합니다.",
+        ephemeral: true,
+      });
+    }
+
+    const blockedMbtiRoles = guild.roles.cache.filter((role) =>
+      MBTI_TYPES.has(role.name.toUpperCase()) &&
+      !canBotManageRole(botMember, role)
+    );
+
+    if (blockedMbtiRoles.size > 0) {
+      return interaction.reply({
+        content:
+          "❌ 봇 역할보다 높은 MBTI 역할은 부여하거나 제거할 수 없습니다.\n" +
+          `봇 역할을 다음 역할보다 위로 올려주세요: ${blockedMbtiRoles.map((role) => `\`${role.name}\``).join(", ")}`,
+        ephemeral: true,
+      });
+    }
+
+    await channel.send(buildMbtiPromptPayload());
+
+    return interaction.reply({
+      content: `✅ ${channel} 채널에 MBTI 선택 메시지를 보냈습니다.`,
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+  }
 
   // =======================
   // 🚪 /퇴장로그
